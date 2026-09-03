@@ -4,6 +4,7 @@ import csv
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from statistics import mean, stdev
+from typing import Mapping
 
 import torch
 from torch import nn
@@ -15,6 +16,12 @@ from .hydrology import (
     SingleSimpleHydrologyModel,
 )
 from .hydrology_data import HydrologyData, HydrologySplit
+from .hydrology_complexity import (
+    HydrologyComplexityEstimator,
+    MODEL_NAMES,
+    SCORE_ROUTING_METHODS,
+    build_hydrology_complexity_estimator,
+)
 
 
 DYNAMIC_NOISE_FEATURES = {"precipitation", "temperature", "pet", "previous_discharge"}
@@ -37,6 +44,8 @@ class HydrologyComparisonRecord:
     physics_error: float
     parameters: int
     mean_complex_weight: float
+    mean_complexity_score: float
+    valid_complexity_fraction: float
 
 
 def _parameter_count(model: nn.Module) -> int:
@@ -87,6 +96,8 @@ def _make_model(
     simple_kind: str,
     complex_kind: str,
     learned_morse_potential: LearnedHydrologyMorsePotential | None = None,
+    complexity_percentile: float = 80.0,
+    gate_temperature: float = 0.15,
 ) -> RoutedHydrologyModel | SingleComplexHydrologyModel:
     sequence_length = data.train.inputs.shape[1]
     if model_name == "single_complex":
@@ -98,7 +109,87 @@ def _make_model(
         data.feature_names, sequence_length, data.discharge_scale,
         simple_kind=simple_kind, complex_kind=complex_kind, routing=model_name,
         learned_morse_potential=learned_morse_potential,
+        complexity_percentile=complexity_percentile,
+        gate_temperature=gate_temperature,
     )
+
+
+def _select_models(
+    models: tuple[str, ...] | None,
+    learned_morse_potential: LearnedHydrologyMorsePotential | None,
+) -> list[str]:
+    available_models = set(MODEL_NAMES)
+    if learned_morse_potential is None:
+        available_models.remove("learned_morse")
+    if models is None:
+        selected = ["morse"]
+        if learned_morse_potential is not None:
+            selected.append("learned_morse")
+        selected.extend(("learned", "single_complex"))
+        return selected
+    selected = list(dict.fromkeys(models))
+    invalid_models = set(selected) - available_models
+    if invalid_models:
+        choices = ", ".join(sorted(available_models))
+        invalid = ", ".join(sorted(invalid_models))
+        raise ValueError(f"unknown or unavailable models: {invalid}; choose from {choices}")
+    if not selected:
+        raise ValueError("models must not be empty")
+    return selected
+
+
+def _prepare_complexity_estimators(
+    data: HydrologyData,
+    selected_models: list[str],
+    estimators: Mapping[str, HydrologyComplexityEstimator] | None,
+) -> dict[str, HydrologyComplexityEstimator]:
+    requested = set(selected_models) & SCORE_ROUTING_METHODS
+    if not requested:
+        return {}
+    splits = (data.train, data.validation, data.test)
+    if any(split.routing_inputs is None for split in splits):
+        raise ValueError("score-based routing requires routing_inputs in every hydrology split")
+    provided = dict(estimators or {})
+    result = {}
+    for name in requested:
+        estimator = provided.get(name) or build_hydrology_complexity_estimator(
+            name, data.feature_names
+        )
+        train_routing = data.train.routing_inputs
+        assert train_routing is not None
+        estimator.fit(train_routing)
+        result[name] = estimator
+    return result
+
+
+def _estimate_complexity_features(
+    estimator: HydrologyComplexityEstimator | None,
+    split: HydrologySplit,
+    feature_names: tuple[str, ...],
+    *,
+    noise: float,
+    seed: int,
+) -> torch.Tensor | None:
+    if estimator is None:
+        return None
+    if split.routing_inputs is None:
+        raise ValueError("score-based routing requires routing_inputs")
+    windows = split.routing_inputs
+    if noise:
+        generator = torch.Generator().manual_seed(seed)
+        windows = _add_observation_noise(windows, feature_names, noise, generator)
+    return estimator.estimate(windows).cpu()
+
+
+def _complexity_diagnostics(features: torch.Tensor | None) -> tuple[float, float]:
+    if features is None:
+        return float("nan"), float("nan")
+    score = features[:, 0]
+    confidence = features[:, 1] if features.shape[1] > 1 else torch.ones_like(score)
+    valid = torch.isfinite(score) & (confidence > 0.0)
+    if not bool(valid.any()):
+        return float("nan"), 0.0
+    return float(score[valid].mean()), float(valid.float().mean())
 
 
 def train_hydrology_model(
@@ -112,6 +203,7 @@ def train_hydrology_model(
     seed: int,
     device: torch.device,
     feature_names: tuple[str, ...] | None = None,
+    routing_features: torch.Tensor | None = None,
 ) -> None:
     if training_noise < 0.0:
         raise ValueError("training_noise must be non-negative")
@@ -120,8 +212,9 @@ def train_hydrology_model(
     inputs = split.inputs.to(device)
     physical = split.physical_inputs.to(device)
     targets = split.targets.to(device)
+    routing_features = None if routing_features is None else routing_features.to(device)
     if isinstance(model, RoutedHydrologyModel):
-        model.fit_router(inputs)
+        model.fit_router(inputs, routing_features)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     generator = torch.Generator(device=device).manual_seed(seed + 104729)
     for _ in range(epochs):
@@ -132,7 +225,16 @@ def train_hydrology_model(
                 inputs[indices], feature_names or (), training_noise, generator
             )
             optimizer.zero_grad()
-            losses = model.losses(batch_inputs, physical[indices], targets[indices])
+            if isinstance(model, RoutedHydrologyModel):
+                batch_routing = None if routing_features is None else routing_features[indices]
+                losses = model.losses(
+                    batch_inputs,
+                    physical[indices],
+                    targets[indices],
+                    routing_features=batch_routing,
+                )
+            else:
+                losses = model.losses(batch_inputs, physical[indices], targets[indices])
             losses.total.backward()
             optimizer.step()
 
@@ -146,19 +248,25 @@ def _evaluate(
     inference_noise: float,
     seed: int,
     device: torch.device,
+    routing_features: torch.Tensor | None = None,
 ) -> tuple[float, float, float, float, float]:
     inputs = split.inputs.to(device)
     physical = split.physical_inputs.to(device)
     if inference_noise:
         generator = torch.Generator(device=device).manual_seed(seed)
         inputs = _add_observation_noise(inputs, data.feature_names, inference_noise, generator)
-    prediction_scaled = model(inputs)
+    routing_features = None if routing_features is None else routing_features.to(device)
+    if isinstance(model, RoutedHydrologyModel):
+        prediction_scaled = model(inputs, routing_features=routing_features)
+    else:
+        prediction_scaled = model(inputs)
     prediction = prediction_scaled * data.discharge_scale.to(device)
     target = split.targets.to(device) * data.discharge_scale.to(device)
     nse, kge, rmse = _metrics(prediction, target)
     physics = float(model.physics_residual(prediction_scaled, physical).square().mean())
     if isinstance(model, RoutedHydrologyModel):
-        usage = float(model.router.complex_weight(inputs.flatten(start_dim=1)).mean())
+        router_features = model._router_features(inputs, routing_features)
+        usage = float(model.router.complex_weight(router_features).mean())
     else:
         usage = 1.0
     return nse, kge, rmse, physics, usage
@@ -178,59 +286,95 @@ def compare_hydrology_models(
     learning_rate: float = 1e-3,
     device: torch.device | str = "cpu",
     learned_morse_potential: LearnedHydrologyMorsePotential | None = None,
+    complexity_estimators: Mapping[str, HydrologyComplexityEstimator] | None = None,
+    complexity_percentile: float = 80.0,
+    gate_temperature: float = 0.15,
 ) -> list[HydrologyComparisonRecord]:
     """Run Morse, learned-gate, and architecture-matched unitary baselines."""
     if epochs < 1 or batch_size < 1:
         raise ValueError("epochs and batch_size must be positive")
     if any(noise < 0.0 for noise in (*training_noise_levels, *inference_noise_levels)):
         raise ValueError("noise levels must be non-negative")
-    available_models = {"morse", "learned", "single_complex"}
-    if learned_morse_potential is not None:
-        available_models.add("learned_morse")
-    if models is None:
-        selected_models = ["morse"]
-        if learned_morse_potential is not None:
-            selected_models.append("learned_morse")
-        selected_models.extend(("learned", "single_complex"))
-    else:
-        selected_models = list(dict.fromkeys(models))
-        invalid_models = set(selected_models) - available_models
-        if invalid_models:
-            choices = ", ".join(sorted(available_models))
-            invalid = ", ".join(sorted(invalid_models))
-            raise ValueError(f"unknown or unavailable models: {invalid}; choose from {choices}")
-        if not selected_models:
-            raise ValueError("models must not be empty")
+    selected_models = _select_models(models, learned_morse_potential)
+    prepared_estimators = _prepare_complexity_estimators(
+        data, selected_models, complexity_estimators
+    )
+    feature_cache: dict[tuple[str, str, float, int], torch.Tensor | None] = {}
+
+    def features_for(
+        model_name: str,
+        split_name: str,
+        split: HydrologySplit,
+        noise: float,
+        score_seed: int,
+    ) -> torch.Tensor | None:
+        key = (model_name, split_name, noise, score_seed)
+        if key not in feature_cache:
+            feature_cache[key] = _estimate_complexity_features(
+                prepared_estimators.get(model_name),
+                split,
+                data.feature_names,
+                noise=noise,
+                seed=score_seed,
+            )
+        return feature_cache[key]
     device = torch.device(device)
     records = []
     for seed in seeds:
         for training_noise in sorted(set(training_noise_levels)):
             for model_name in selected_models:
+                train_features = features_for(
+                    model_name, "train", data.train, training_noise, seed + 100003
+                )
                 torch.manual_seed(seed)
                 model = _make_model(
-                    model_name, data, simple_kind, complex_kind, learned_morse_potential
+                    model_name,
+                    data,
+                    simple_kind,
+                    complex_kind,
+                    learned_morse_potential,
+                    complexity_percentile,
+                    gate_temperature,
                 ).to(device)
                 train_hydrology_model(
                     model, data.train, epochs=epochs, batch_size=batch_size,
                     learning_rate=learning_rate, training_noise=training_noise,
                     seed=seed, device=device, feature_names=data.feature_names,
+                    routing_features=train_features,
                 )
                 for inference_noise in sorted(set(inference_noise_levels)):
+                    validation_features = features_for(
+                        model_name,
+                        "validation",
+                        data.validation,
+                        inference_noise,
+                        seed + 200003,
+                    )
+                    test_features = features_for(
+                        model_name,
+                        "test",
+                        data.test,
+                        inference_noise,
+                        seed + 300007,
+                    )
                     validation_nse, _, _, _, _ = _evaluate(
                         model, data.validation, data, inference_noise=inference_noise,
                         seed=seed + 200003, device=device,
+                        routing_features=validation_features,
                     )
                     test_nse, test_kge, test_rmse, physics, usage = _evaluate(
                         model, data.test, data, inference_noise=inference_noise,
                         seed=seed + 300007, device=device,
+                        routing_features=test_features,
                     )
+                    mean_score, valid_fraction = _complexity_diagnostics(test_features)
                     records.append(
                         HydrologyComparisonRecord(
                             data.country, data.basin_id, model_name,
                             simple_kind if model_name != "single_complex" else "none",
                             complex_kind, seed, training_noise, inference_noise,
                             validation_nse, test_nse, test_kge, test_rmse,
-                            physics, _parameter_count(model), usage,
+                            physics, _parameter_count(model), usage, mean_score, valid_fraction,
                         )
                     )
     return records
@@ -256,7 +400,7 @@ def hydrology_comparison_summary(records: list[HydrologyComparisonRecord]) -> st
         f"{records[0].country}, basin {records[0].basin}; complex expert: {records[0].complex_expert}",
         "model             train N  infer N  test NSE (mean +/- std)   KGE       RMSE mm/day  physics",
     ]
-    model_order = ("morse", "learned_morse", "learned", "single_complex")
+    model_order = MODEL_NAMES
     for model_name in model_order:
         for training_noise in sorted({record.training_noise for record in records}):
             for inference_noise in sorted({record.inference_noise for record in records}):
@@ -285,7 +429,7 @@ def plot_hydrology_comparison(
 ) -> None:
     from .visualization import _finish_figure, _pyplot
 
-    model_order = ("morse", "learned_morse", "learned", "single_complex")
+    model_order = MODEL_NAMES
     models = tuple(model for model in model_order if any(record.model == model for record in records))
     conditions = sorted(
         {(record.training_noise, record.inference_noise) for record in records}

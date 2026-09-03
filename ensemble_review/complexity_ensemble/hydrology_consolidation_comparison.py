@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 import torch
 
@@ -12,14 +13,19 @@ from .hydrology import (
 )
 from .hydrology_comparison import (
     _add_observation_noise,
+    _complexity_diagnostics,
     _evaluate,
     _make_model,
     _parameter_count,
+    _estimate_complexity_features,
+    _prepare_complexity_estimators,
+    _select_models,
     hydrology_comparison_summary,
     plot_hydrology_comparison,
     save_hydrology_comparison,
 )
 from .hydrology_data import HydrologyData, HydrologySplit
+from .hydrology_complexity import HydrologyComplexityEstimator
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,8 @@ class HydrologyConsolidationComparisonRecord:
     physics_error: float
     parameters: int
     mean_complex_weight: float
+    mean_complexity_score: float
+    valid_complexity_fraction: float
     consolidation_weight: float
 
 
@@ -54,6 +62,7 @@ def train_hydrology_model_with_consolidation(
     device: torch.device,
     consolidation_weight: float,
     feature_names: tuple[str, ...],
+    routing_features: torch.Tensor | None = None,
 ) -> None:
     """Train without changing the behavior of the standard hydrology trainer."""
     if consolidation_weight < 0.0:
@@ -63,8 +72,9 @@ def train_hydrology_model_with_consolidation(
     inputs = split.inputs.to(device)
     physical = split.physical_inputs.to(device)
     targets = split.targets.to(device)
+    routing_features = None if routing_features is None else routing_features.to(device)
     if isinstance(model, RoutedHydrologyModel):
-        model.fit_router(inputs)
+        model.fit_router(inputs, routing_features)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     generator = torch.Generator(device=device).manual_seed(seed + 104729)
     for _ in range(epochs):
@@ -76,10 +86,12 @@ def train_hydrology_model_with_consolidation(
             )
             optimizer.zero_grad()
             if isinstance(model, RoutedHydrologyModel):
+                batch_routing = None if routing_features is None else routing_features[indices]
                 losses = model.losses(
                     batch_inputs,
                     physical[indices],
                     targets[indices],
+                    routing_features=batch_routing,
                     interface_weight=consolidation_weight,
                 )
             else:
@@ -103,6 +115,9 @@ def compare_hydrology_models_with_consolidation(
     consolidation_weight: float = 0.05,
     device: torch.device | str = "cpu",
     learned_morse_potential: LearnedHydrologyMorsePotential | None = None,
+    complexity_estimators: Mapping[str, HydrologyComplexityEstimator] | None = None,
+    complexity_percentile: float = 80.0,
+    gate_temperature: float = 0.15,
 ) -> list[HydrologyConsolidationComparisonRecord]:
     """Run an isolated comparison with configurable boundary consolidation."""
     if epochs < 1 or batch_size < 1:
@@ -111,32 +126,47 @@ def compare_hydrology_models_with_consolidation(
         raise ValueError("consolidation_weight must be non-negative")
     if any(noise < 0.0 for noise in (*training_noise_levels, *inference_noise_levels)):
         raise ValueError("noise levels must be non-negative")
-    available_models = {"morse", "learned", "single_complex"}
-    if learned_morse_potential is not None:
-        available_models.add("learned_morse")
-    if models is None:
-        selected_models = ["morse"]
-        if learned_morse_potential is not None:
-            selected_models.append("learned_morse")
-        selected_models.extend(("learned", "single_complex"))
-    else:
-        selected_models = list(dict.fromkeys(models))
-        invalid_models = set(selected_models) - available_models
-        if invalid_models:
-            choices = ", ".join(sorted(available_models))
-            invalid = ", ".join(sorted(invalid_models))
-            raise ValueError(f"unknown or unavailable models: {invalid}; choose from {choices}")
-        if not selected_models:
-            raise ValueError("models must not be empty")
+    selected_models = _select_models(models, learned_morse_potential)
+    prepared_estimators = _prepare_complexity_estimators(
+        data, selected_models, complexity_estimators
+    )
+    feature_cache: dict[tuple[str, str, float, int], torch.Tensor | None] = {}
+
+    def features_for(
+        model_name: str,
+        split_name: str,
+        split: HydrologySplit,
+        noise: float,
+        score_seed: int,
+    ) -> torch.Tensor | None:
+        key = (model_name, split_name, noise, score_seed)
+        if key not in feature_cache:
+            feature_cache[key] = _estimate_complexity_features(
+                prepared_estimators.get(model_name),
+                split,
+                data.feature_names,
+                noise=noise,
+                seed=score_seed,
+            )
+        return feature_cache[key]
 
     device = torch.device(device)
     records = []
     for seed in seeds:
         for training_noise in sorted(set(training_noise_levels)):
             for model_name in selected_models:
+                train_features = features_for(
+                    model_name, "train", data.train, training_noise, seed + 100003
+                )
                 torch.manual_seed(seed)
                 model = _make_model(
-                    model_name, data, simple_kind, complex_kind, learned_morse_potential
+                    model_name,
+                    data,
+                    simple_kind,
+                    complex_kind,
+                    learned_morse_potential,
+                    complexity_percentile,
+                    gate_temperature,
                 ).to(device)
                 train_hydrology_model_with_consolidation(
                     model,
@@ -149,8 +179,23 @@ def compare_hydrology_models_with_consolidation(
                     device=device,
                     consolidation_weight=consolidation_weight,
                     feature_names=data.feature_names,
+                    routing_features=train_features,
                 )
                 for inference_noise in sorted(set(inference_noise_levels)):
+                    validation_features = features_for(
+                        model_name,
+                        "validation",
+                        data.validation,
+                        inference_noise,
+                        seed + 200003,
+                    )
+                    test_features = features_for(
+                        model_name,
+                        "test",
+                        data.test,
+                        inference_noise,
+                        seed + 300007,
+                    )
                     validation_nse, _, _, _, _ = _evaluate(
                         model,
                         data.validation,
@@ -158,6 +203,7 @@ def compare_hydrology_models_with_consolidation(
                         inference_noise=inference_noise,
                         seed=seed + 200003,
                         device=device,
+                        routing_features=validation_features,
                     )
                     test_nse, test_kge, test_rmse, physics, usage = _evaluate(
                         model,
@@ -166,7 +212,9 @@ def compare_hydrology_models_with_consolidation(
                         inference_noise=inference_noise,
                         seed=seed + 300007,
                         device=device,
+                        routing_features=test_features,
                     )
+                    mean_score, valid_fraction = _complexity_diagnostics(test_features)
                     records.append(
                         HydrologyConsolidationComparisonRecord(
                             data.country,
@@ -184,6 +232,8 @@ def compare_hydrology_models_with_consolidation(
                             physics,
                             _parameter_count(model),
                             usage,
+                            mean_score,
+                            valid_fraction,
                             consolidation_weight,
                         )
                     )

@@ -42,6 +42,7 @@ def _slice_split(split: HydrologySplit, start: int, stop: int) -> HydrologySplit
     return HydrologySplit(
         split.inputs[start:stop], split.physical_inputs[start:stop], split.targets[start:stop],
         split.target_dates[start:stop],
+        None if split.routing_inputs is None else split.routing_inputs[start:stop],
     )
 
 

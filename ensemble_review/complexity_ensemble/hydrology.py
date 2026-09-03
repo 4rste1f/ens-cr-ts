@@ -11,7 +11,8 @@ from torch.nn import functional as F
 
 from .experts import MLPExpert, build_expert
 from .pinnmamba import PINNMamba
-from .routing import LearnedRouter, MorseRouter
+from .hydrology_complexity import SCORE_ROUTING_METHODS
+from .routing import LearnedRouter, MorseRouter, ScoreRouter
 
 
 @dataclass
@@ -280,21 +281,44 @@ class RoutedHydrologyModel(_HydrologyModelBase):
             self.router = LearnedHydrologyMorseRouter(
                 learned_morse_potential, complexity_percentile, gate_temperature
             )
+        elif routing in SCORE_ROUTING_METHODS:
+            self.router = ScoreRouter(complexity_percentile, gate_temperature)
         else:
-            raise ValueError("routing must be 'morse', 'learned_morse', or 'learned'")
+            choices = ", ".join(("morse", "learned_morse", "learned", *sorted(SCORE_ROUTING_METHODS)))
+            raise ValueError(f"routing must be one of: {choices}")
         self.simple_kind = simple_kind
         self.complex_kind = complex_kind
         self.routing_kind = routing
 
-    def fit_router(self, inputs: torch.Tensor) -> "RoutedHydrologyModel":
-        self.router.fit(inputs.flatten(start_dim=1))
+    def _router_features(
+        self,
+        inputs: torch.Tensor,
+        routing_features: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.routing_kind in SCORE_ROUTING_METHODS:
+            if routing_features is None:
+                raise ValueError(f"routing_features are required for {self.routing_kind} routing")
+            return routing_features
+        return inputs.flatten(start_dim=1)
+
+    def fit_router(
+        self,
+        inputs: torch.Tensor,
+        routing_features: torch.Tensor | None = None,
+    ) -> "RoutedHydrologyModel":
+        self.router.fit(self._router_features(inputs, routing_features))
         return self
 
     def forward(
-        self, inputs: torch.Tensor, *, hard: bool = False, return_details: bool = False
+        self,
+        inputs: torch.Tensor,
+        *,
+        routing_features: torch.Tensor | None = None,
+        hard: bool = False,
+        return_details: bool = False,
     ) -> torch.Tensor | HydrologyRoutedOutput:
-        flat = inputs.flatten(start_dim=1)
-        weight = self.router.complex_weight(flat, hard=hard)
+        router_features = self._router_features(inputs, routing_features)
+        weight = self.router.complex_weight(router_features, hard=hard)
         simple = self.simple_expert(inputs)
         complex_value = self.complex_expert(inputs)
         discharge = self._positive_discharge(torch.lerp(simple, complex_value, weight[:, None]))
@@ -308,19 +332,20 @@ class RoutedHydrologyModel(_HydrologyModelBase):
         physical_inputs: torch.Tensor,
         targets: torch.Tensor,
         *,
+        routing_features: torch.Tensor | None = None,
         physics_weight: float = 0.05,
         interface_weight: float = 0.05,
         routing_weight: float = 0.05,
         compute_weight: float = 0.0,
     ) -> HydrologyLosses:
-        routed = self(inputs, return_details=True)
+        routed = self(inputs, routing_features=routing_features, return_details=True)
         assert isinstance(routed, HydrologyRoutedOutput)
         data = (routed.discharge.squeeze(-1) - targets).square().mean()
         physics = self.physics_residual(routed.discharge, physical_inputs).square().mean()
         transition = 4.0 * routed.complex_weight * (1.0 - routed.complex_weight)
         interface = (transition * (routed.simple_raw - routed.complex_raw).square().squeeze(-1)).mean()
-        flat = inputs.flatten(start_dim=1)
-        routing = self.router.regularization(flat)
+        router_features = self._router_features(inputs, routing_features)
+        routing = self.router.regularization(router_features)
         complex_usage = routed.complex_weight.mean()
         total = (
             data + physics_weight * physics + interface_weight * interface

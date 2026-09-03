@@ -1,0 +1,120 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,booktabs,enumitem}
+\usepackage[hidelinks]{hyperref}
+\newcommand{\TODO}[1]{\textcolor{red}{[TODO: #1]}}
+\usepackage{xcolor}
+\title{Complexity-Conditioned Expert Routing for\
+Robust Daily Rainfall--Runoff Prediction}
+\author{\TODO{Author names and affiliations}}
+\date{\TODO{Draft date}}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Hydrological prediction must represent both relatively regular catchment responses and rapid, event-driven dynamics, while retaining skill when its observed inputs are imperfect. We present an experimental framework for testing whether a complexity-conditioned mixture of experts can make this trade-off explicit. A light expert and a higher-capacity expert produce daily discharge estimates from the same past-only forcing history. A differentiable gate assigns a soft complex-expert weight from an analytically specified or learned Morse-style complexity score. The training objective additionally consolidates the experts at uncertain routing boundaries, where their disagreement has the greatest effect on the mixture. The study is designed as a controlled comparison across routing mechanisms, expert architectures, catchments, hyperparameters, and clean/noisy input conditions. This paper is a methods draft: it specifies the protocol and reporting standard, but intentionally contains no experimental results.
+\end{abstract}
+
+\section{Introduction}
+Daily rainfall--runoff modelling couples a forecasting problem with a changing physical system. A single model class may be adequate in portions of the hydroclimatic state space yet be inefficient or brittle in others. For example, slowly varying wetness conditions and rapid runoff responses need not demand the same representation. Mixture-of-experts models offer a direct way to allocate capacity conditionally, but an unconstrained learned gate can be difficult to interpret and can make unstable decisions near a regime boundary.
+
+This work studies a complexity-conditioned alternative. Rather than treating the gate only as a latent classifier, we route from a scalar score derived from the recent hydro-meteorological trajectory. The central question is: \emph{does explicit routing by local dynamical complexity, combined with boundary consolidation, improve the accuracy--robustness--interpretability trade-off of daily discharge prediction?}
+
+The scope is deliberately narrow. All experiments use the repository entry point \url{examples/compare_learned_morse_hydrology_consolidation.py}; no results are generated for this draft. The paper therefore provides a preregistered-style methods description and a results scaffold to be populated after runs are complete.
+
+\section{Problem formulation}
+Let $\mathbf{x}_t \in \mathbb{R}^{L\times p}$ be a window of the $L$ observations immediately preceding day $t$, and let $y_t$ be observed specific discharge on day $t$. The input includes meteorological forcings (precipitation, temperature, and potential evapotranspiration), previous discharge, and seasonal sine/cosine features; available land-cover covariates may also be included. The target is one-day-ahead discharge.
+
+The data are ordered chronologically and split into training, validation, and test segments (default proportions 60\%, 20\%, and 20\%). Windows that cross a missing day are excluded. Feature standardization and the discharge scaling factor are estimated using the training segment only, then applied unchanged to validation and test data. Thus, neither normalization nor routing-threshold estimation uses future observations.
+
+\section{Method}
+\subsection{Routed predictors}
+Two experts receive the same short history $\mathbf{x}_t$. The simple expert $f_s$ is either a radial-basis-function (RBF) or Fourier-feature predictor over the flattened window. The complex expert $f_c$ is either a multilayer perceptron (MLP) over the flattened window or a sequence PINNMamba architecture. Their raw outputs are mixed before a softplus transform ensures non-negative predicted discharge:
+\begin{equation}
+ \hat y_t = \operatorname{softplus}\!\left((1-w_t)f_s(\mathbf{x}_t)+w_t f_c(\mathbf{x}_t)\right),
+ \label{eq:mixture}
+\end{equation}
+where $w_t\in[0,1]$ is the complex-expert weight. A single-complex-expert model is included as a capacity-matched non-routed baseline.
+
+\subsection{Complexity-conditioned routing}
+For score-based routers, a score $s_t$ is calibrated on the training split. Let $\tau$ be the selected training quantile (default: the 80th percentile) and let $r$ be the training interquartile range of the scores. The soft gate is
+\begin{equation}
+ w_t = \sigma\!\left(\frac{s_t-\tau}{\gamma\,r}\right),
+ \label{eq:gate}
+\end{equation}
+where $\sigma$ is the logistic function and $\gamma$ is a temperature relative to the score interquartile range. This construction makes the threshold and transition width observable quantities, and retains a soft mixture rather than imposing a hard regime label.
+
+We compare the following selectable routing mechanisms:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Analytic Morse routing.} The score is the norm of the gradient of a hand-specified potential over standardized history. The potential combines recent effective precipitation (precipitation minus PET), antecedent discharge, and first differences of precipitation and discharge, with greater weight on recent observations.
+  \item \textbf{Learned-Morse routing.} A small scalar potential is learned before final ensemble training. It takes summary statistics of the standardized window (current value, mean, variation, end-to-end change, and recent means) and assigns complexity as the norm of its input gradient. The potential is calibrated by ranking windows according to cross-fitted complex-expert utility: the complex expert's advantage in squared prediction error plus weighted physics-residual advantage. It is frozen before the final routed model is trained.
+  \item \textbf{Learned routing baseline.} A conventional neural gate is trained jointly with the experts and regularized toward the target complex-route fraction implied by the percentile. This tests whether an unconstrained learned partition suffices.
+  \item \textbf{Optional dynamical-complexity routes.} Persistent-homology summaries of a Takens reconstruction (TDA) and confidence-filtered finite-time Lyapunov estimates provide external scalar scores from longer, past-only discharge histories. Their thresholds are likewise fitted on training scores only. Invalid Lyapunov estimates receive zero complex-expert weight through a confidence factor.
+\end{enumerate}
+
+\subsection{Physics-aware and boundary-consolidated training}
+The routed model is optimized with data error, a reservoir-style mass-balance residual, routing regularization where applicable, and an optional compute-use penalty. The physical residual compares the predicted discharge change to effective precipitation response minus recession of previous flow. The distinguishing term is interface consolidation:
+\begin{equation}
+ \mathcal{L}_{\mathrm{interface}} = \frac{1}{N}\sum_{t=1}^{N}
+ 4w_t(1-w_t)\left[f_s(\mathbf{x}_t)-f_c(\mathbf{x}_t)\right]^2.
+ \label{eq:interface}
+\end{equation}
+The factor $4w_t(1-w_t)$ is maximal for a 50--50 mixture and vanishes when the route selects either expert with certainty. Therefore the penalty asks experts to agree only where routing is ambiguous; it does not force the experts to become globally identical. The full objective is
+\begin{equation}
+ \mathcal{L}=\mathcal{L}_{\mathrm{data}}+\lambda_p\mathcal{L}_{\mathrm{physics}}
+ +\lambda_i\mathcal{L}_{\mathrm{interface}}+\lambda_r\mathcal{L}_{\mathrm{routing}}
+ +\lambda_c\overline{w}.
+\end{equation}
+The primary comparison varies $\lambda_i$ (\texttt{--consolidation-weight}); $\lambda_i=0$ is the otherwise identical ablation.
+
+\section{Experimental design}
+\subsection{Data and configurations}
+The entry point supports CAMELS-CH catchments and locally prepared Ukrainian daily records. Each experiment records the source, basin identifier, date range, feature configuration, and all command-line arguments in a machine-readable configuration file. We will evaluate multiple catchments and parameter settings rather than select a single favorable configuration. The final manuscript should report the complete basin list, inclusion criteria, data availability constraints, and all failed or excluded runs.
+
+The study varies the simple expert (RBF/Fourier), complex expert (MLP/PINNMamba), selected router set, sequence and routing-context lengths, complexity percentile, gate temperature, consolidation weight, random seed, and input-noise level. TDA and Lyapunov routing use longer past-only contexts than the expert input window when selected. All hyperparameter choices and any selection criterion must be fixed on training/validation data; test data are reserved for final reporting.
+
+\subsection{Noise robustness protocol}
+For each training-noise level, we train a clean-input model and a model with Gaussian perturbations injected into training-standardized dynamic inputs. Perturbations are restricted to precipitation, temperature, PET, and previous discharge. Each trained model is evaluated under both clean and noisy inputs, yielding a $2\times2$ grid:
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+ & Clean inference & Noisy inference \\
+\midrule
+Clean training & in-distribution reference & inference robustness \\
+Noisy training & training-noise cost & matched-noise robustness \\
+\bottomrule
+\end{tabular}
+\end{center}
+This separation distinguishes a benefit from noise-aware training from a simple change in clean-condition performance.
+
+\subsection{Baselines and ablations}
+At minimum, every experiment should include the single complex model, analytic Morse router, learned-Morse router when its calibration is available, and learned-gate baseline. Where dependencies and data length permit, TDA and Lyapunov routers should be added as mechanistically distinct comparators. Key ablations are: no interface consolidation ($\lambda_i=0$); varied consolidation weights; alternative expert pairs; varied quantile/temperature; and varied history lengths. The final analysis should not claim superiority from a single basin, seed, noise draw, or hyperparameter setting.
+
+\section{Evaluation and reporting}
+Primary predictive metrics are Nash--Sutcliffe efficiency (NSE), Kling--Gupta efficiency (KGE), and RMSE in mm day$^{-1}$. We additionally report the reservoir physics error, parameter count, mean complex-expert weight, mean complexity score, and valid-complexity-estimate fraction. For learned-Morse calibration, report the number of cross-fitted samples, positive-utility fraction, score--utility Spearman correlation, ranking loss, and transfer diagnostics on validation/test windows.
+
+Results should be aggregated over the prespecified seeds and basins. Report distributions or uncertainty intervals, not only a best run. Compare methods paired within basin, seed, and noise condition. Alongside aggregate scores, stratify errors by hydrologically relevant conditions such as high flow, low flow, rising limb, recession, and season, if those strata are defined before examining test outcomes. Plot the full robustness grid and the distribution of complex weights to reveal whether apparent gains depend on near-constant use of the complex expert.
+
+\section{Interpretation, limitations, and environmental relevance}
+Complexity in this study is an operational routing signal, not a claim that catchment dynamics have been fully identified or that a scalar score is a universal physical regime definition. The learned potential is calibrated to relative expert utility under this modelling setup, so its transferability must be measured rather than assumed. The physics term is a deliberately simple reservoir constraint; low residual does not establish hydrological realism, causal validity, or reliable extrapolation under unprecedented change.
+
+Environmental change makes these qualifications important. Shifts in precipitation timing, snow processes, land cover, water management, and measurement practices may alter both runoff generation and the relationship between a complexity score and expert utility. Evaluation should therefore document temporal coverage, basin attributes, forcing provenance, missing-data handling, and performance under perturbation. Out-of-domain and scenario-based tests should be clearly separated from interpolation tests.
+
+\section{Results scaffold (intentionally empty)}
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Data coverage and protocol:} \TODO{Insert basin table, periods, exclusions, and final configuration grid.}
+  \item \textbf{Main comparison:} \TODO{Insert paired NSE/KGE/RMSE/physics results across basins and seeds.}
+  \item \textbf{Boundary consolidation:} \TODO{Insert $\lambda_i$ ablation and boundary-disagreement analysis.}
+  \item \textbf{Robustness:} \TODO{Insert the clean/noisy $2\times2$ grid and uncertainty summaries.}
+  \item \textbf{Routing diagnostics:} \TODO{Insert complex-weight, score-validity, and learned-potential utility-alignment results.}
+  \item \textbf{Failure modes:} \TODO{Report all failures, sensitivity analyses, and conditions where routing does not help.}
+\end{itemize}
+
+\section{Conclusion}
+This draft defines a controlled test of complexity-conditioned routing for daily rainfall--runoff prediction. Its contribution is not a pre-asserted performance result, but a transparent experimental design: past-only complexity estimation, explicit baselines, soft boundary-aware mixtures, a consolidation ablation, and clean/noisy robustness evaluation. Filling the results scaffold with complete multi-basin, multi-seed evidence will determine whether the approach is useful for environmental prediction under changing and imperfect observations.
+
+\end{document}
