@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import json
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -10,10 +12,14 @@ import torch
 from complexity_ensemble.hydrology_data import HydrologySeries, make_hydrology_data
 from examples.compare_learned_morse_hydrology_robustness import (
     EvaluationPeriod,
+    build_parser,
     coherently_corrupt_split,
     compare_hydrology_models_dose_response,
     parse_period,
+    parse_bool,
     plot_dose_response,
+    plot_noise_surfaces,
+    save_results_json,
 )
 
 
@@ -73,12 +79,31 @@ class CoherentHydrologyRobustnessTests(unittest.TestCase):
             figure = Path(directory) / "dose_response.png"
             plot_dose_response(records, figure)
             self.assertTrue(figure.exists())
+            surface = Path(directory) / "noise_surfaces.png"
+            plot_noise_surfaces(records, surface)
+            self.assertTrue(surface.exists())
+
+            result_path = Path(directory) / "results.json"
+            save_results_json(records, {"viz": False, "epochs": 1}, [], result_path)
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 1)
+            self.assertEqual(payload["summary"]["record_count"], 12)
+            self.assertEqual(payload["dimensions"]["seeds"], [0])
+            self.assertEqual(len(payload["records"]), 12)
+            self.assertEqual(payload["configuration"]["viz"], False)
 
     def test_period_parser(self) -> None:
         self.assertEqual(
             parse_period("wet:2000-01-01:2001-01-01"),
             EvaluationPeriod("wet", "2000-01-01", "2001-01-01"),
         )
+
+    def test_boolean_parser(self) -> None:
+        self.assertTrue(parse_bool("true"))
+        self.assertFalse(parse_bool("FALSE"))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_bool("yes")
+        self.assertFalse(build_parser().parse_args(["--viz", "false"]).viz)
 
 
 if __name__ == "__main__":

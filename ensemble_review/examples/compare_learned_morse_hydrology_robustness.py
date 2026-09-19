@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from dataclasses import asdict, dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -114,6 +115,16 @@ def parse_period(value: str) -> EvaluationPeriod:
     if end_date <= start_date:
         raise argparse.ArgumentTypeError("period end must be later than period start")
     return EvaluationPeriod(label, start, end)
+
+
+def parse_bool(value: str) -> bool:
+    """Parse an explicit true/false command-line value."""
+    normalized = value.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
 
 
 def _window_dates(target_date: date, length: int) -> tuple[date, ...]:
@@ -297,6 +308,57 @@ def save_records(records: list[RobustnessRecord], path: Path) -> None:
         writer.writerows(asdict(record) for record in records)
 
 
+def save_results_json(
+    records: list[RobustnessRecord],
+    configuration: Mapping[str, object],
+    failures: list[dict],
+    path: Path,
+) -> None:
+    """Save the complete experiment as one self-describing JSON document."""
+    def unique(field: str) -> list:
+        return sorted({getattr(record, field) for record in records})
+
+    run_keys = {
+        (record.country, record.basin, record.period, record.period_start, record.period_end)
+        for record in records
+    }
+    payload = {
+        "schema_version": 1,
+        "experiment": "learned_morse_hydrology_robustness",
+        "configuration": dict(configuration),
+        "summary": {
+            "status": "failed" if not records else "partial" if failures else "complete",
+            "record_count": len(records),
+            "successful_run_count": len(run_keys),
+            "failed_run_count": len(failures),
+        },
+        "dimensions": {
+            "countries": unique("country"),
+            "basins": unique("basin"),
+            "periods": [
+                {"label": label, "start": start, "end": end}
+                for label, start, end in sorted(
+                    {(record.period, record.period_start, record.period_end) for record in records}
+                )
+            ],
+            "models": unique("model"),
+            "seeds": unique("seed"),
+            "training_noise_levels": unique("training_noise"),
+            "inference_noise_levels": unique("inference_noise"),
+            "training_noise_seeds": unique("training_noise_seed"),
+            "inference_noise_seeds": unique("inference_noise_seed"),
+        },
+        "records": [asdict(record) for record in records],
+        "failures": failures,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as output:
+        json.dump(_jsonable(payload), output, indent=2, sort_keys=True, allow_nan=False)
+        output.write("\n")
+    temporary_path.replace(path)
+
+
 def plot_dose_response(records: list[RobustnessRecord], path: Path) -> None:
     """Plot inference-noise response curves separately for each training dose."""
     if not records:
@@ -357,13 +419,70 @@ def plot_dose_response(records: list[RobustnessRecord], path: Path) -> None:
     _finish_figure(figure, path)
 
 
+def plot_noise_surfaces(records: list[RobustnessRecord], path: Path) -> None:
+    """Plot mean metric surfaces over paired training and inference noise."""
+    if not records:
+        raise ValueError("cannot plot empty robustness results")
+    from complexity_ensemble.visualization import _finish_figure, _pyplot
+
+    models = tuple(
+        model for model in MODEL_NAMES if any(record.model == model for record in records)
+    )
+    training_levels = sorted({record.training_noise for record in records})
+    inference_levels = sorted({record.inference_noise for record in records})
+    metrics = (
+        ("test_nse", "Mean test NSE", "viridis"),
+        ("test_kge", "Mean test KGE", "viridis"),
+        ("test_rmse_mm_day", "Mean RMSE (mm/day)", "magma"),
+    )
+    plt = _pyplot()
+    figure, axes = plt.subplots(
+        len(metrics), len(models), figsize=(4.2 * len(models), 3.4 * len(metrics)),
+        squeeze=False,
+    )
+    for column, model in enumerate(models):
+        for row, (field, label, color_map) in enumerate(metrics):
+            values = []
+            for training_noise in training_levels:
+                line = []
+                for inference_noise in inference_levels:
+                    group = [
+                        getattr(record, field)
+                        for record in records
+                        if record.model == model
+                        and record.training_noise == training_noise
+                        and record.inference_noise == inference_noise
+                    ]
+                    line.append(mean(group) if group else math.nan)
+                values.append(line)
+            axis = axes[row][column]
+            image = axis.imshow(values, aspect="auto", origin="lower", cmap=color_map)
+            axis.set_xticks(range(len(inference_levels)), [f"{level:g}" for level in inference_levels])
+            axis.set_yticks(range(len(training_levels)), [f"{level:g}" for level in training_levels])
+            axis.set_xlabel("Inference noise $\\sigma$")
+            if column == 0:
+                axis.set_ylabel("Training noise $\\sigma$")
+            if row == 0:
+                axis.set_title(model)
+            figure.colorbar(image, ax=axis, label=label)
+    first = records[0]
+    figure.suptitle(
+        f"{first.country} basin {first.basin}, period {first.period}: noise robustness surfaces"
+    )
+    _finish_figure(figure, path)
+
+
 def _jsonable(value):
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, EvaluationPeriod):
         return asdict(value)
-    if isinstance(value, tuple):
+    if isinstance(value, Mapping):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     return value
 
 
@@ -457,9 +576,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--training-noise-levels", default="0,0.05,0.1,0.2")
     parser.add_argument("--inference-noise-levels", default="0,0.025,0.05,0.1,0.2,0.4")
     parser.add_argument("--inference-noise-draws", type=int, default=10)
-    parser.add_argument("--consolidation-weight", type=float, default=0.05)
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--consolidation-weight", type=float, default=0.25)
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument(
+        "--viz", type=parse_bool, default=True, metavar="true|false",
+        help="Generate dose-response and noise-surface figures (default: true)",
+    )
     parser.add_argument(
         "--output-dir", type=Path,
         default=Path("artifacts/hydrology/coherent_noise_robustness"),
@@ -542,7 +665,13 @@ def main() -> None:
                 )
                 all_records.extend(records)
                 save_records(records, args.output_dir / f"{run_name}_comparison.csv")
-                plot_dose_response(records, args.output_dir / f"{run_name}.png")
+                if args.viz:
+                    plot_dose_response(
+                        records, args.output_dir / f"{run_name}_dose_response.png"
+                    )
+                    plot_noise_surfaces(
+                        records, args.output_dir / f"{run_name}_noise_surfaces.png"
+                    )
                 print(hydrology_comparison_summary(records))
             except Exception as error:
                 if not args.continue_on_error:
@@ -552,10 +681,9 @@ def main() -> None:
 
     if all_records:
         save_records(all_records, args.output_dir / "all_comparisons.csv")
-    if failures:
-        with (args.output_dir / "failures.json").open("w", encoding="utf-8") as output:
-            json.dump(failures, output, indent=2)
-            output.write("\n")
+    save_results_json(
+        all_records, configuration, failures, args.output_dir / "results.json"
+    )
     if not all_records:
         raise RuntimeError("no basin-period run completed")
     print(f"saved {len(all_records)} records under {args.output_dir}")

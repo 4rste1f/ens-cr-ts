@@ -43,9 +43,16 @@ def parse_models(value: str, parser: argparse.ArgumentParser) -> tuple[str, ...]
     return models
 
 
-def main() -> None:
+def main(
+    comparison_function=compare_hydrology_models_with_consolidation,
+    *,
+    description: str = "Compare selectable hydrology routing models with isolated boundary consolidation",
+    default_output_dir: Path = Path("artifacts/hydrology/learned_morse_consolidation"),
+    stem_suffix: str = "",
+    result_label: str = "isolated consolidation",
+) -> None:
     parser = argparse.ArgumentParser(
-        description="Compare selectable hydrology routing models with isolated boundary consolidation"
+        description=description
     )
     parser.add_argument("--source", choices=("camels_ch", "ukraine_csv"), default="camels_ch")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_CAMELS_CH_ROOT)
@@ -121,7 +128,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("artifacts/hydrology/learned_morse_consolidation"),
+        default=default_output_dir,
     )
     args = parser.parse_args()
     models = parse_models(args.models, parser)
@@ -213,7 +220,7 @@ def main() -> None:
             min_r2=args.lyapunov_min_r2,
             context_length=args.lyapunov_context_length,
         )
-    records = compare_hydrology_models_with_consolidation(
+    records = comparison_function(
         data,
         models=models,
         simple_kind=args.simple,
@@ -232,7 +239,7 @@ def main() -> None:
     )
     stem = (
         f"{args.source}_{args.basin}_{args.simple}_{args.complex}_{'-'.join(models)}"
-        f"_consolidation_{args.consolidation_weight:g}"
+        f"_consolidation_{args.consolidation_weight:g}{stem_suffix}"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configuration = {
@@ -264,7 +271,7 @@ def main() -> None:
             )
     print(hydrology_comparison_summary(records))
     print(f"consolidation weight={args.consolidation_weight:g}")
-    print(f"saved isolated consolidation results under {args.output_dir}")
+    print(f"saved {result_label} results under {args.output_dir}")
 
 
 if __name__ == "__main__":

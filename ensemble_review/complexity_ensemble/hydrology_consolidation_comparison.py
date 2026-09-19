@@ -63,6 +63,7 @@ def train_hydrology_model_with_consolidation(
     consolidation_weight: float,
     feature_names: tuple[str, ...],
     routing_features: torch.Tensor | None = None,
+    verbose: bool = False,
 ) -> None:
     """Train without changing the behavior of the standard hydrology trainer."""
     if consolidation_weight < 0.0:
@@ -77,7 +78,8 @@ def train_hydrology_model_with_consolidation(
         model.fit_router(inputs, routing_features)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     generator = torch.Generator(device=device).manual_seed(seed + 104729)
-    for _ in range(epochs):
+    for epoch in range(epochs):
+        epoch_total = 0.0
         permutation = torch.randperm(len(inputs), generator=generator, device=device)
         for start in range(0, len(inputs), batch_size):
             indices = permutation[start : start + batch_size]
@@ -98,6 +100,13 @@ def train_hydrology_model_with_consolidation(
                 losses = model.losses(batch_inputs, physical[indices], targets[indices])
             losses.total.backward()
             optimizer.step()
+            epoch_total += float(losses.total.detach()) * len(indices)
+        if verbose:
+            print(
+                f"  training epoch {epoch + 1}/{epochs}: "
+                f"loss={epoch_total / len(inputs):.6f}",
+                flush=True,
+            )
 
 
 def compare_hydrology_models_with_consolidation(
