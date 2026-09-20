@@ -8,6 +8,12 @@ from .hydrology import (
     SingleComplexHydrologyModel,
 )
 from .hydrology_data import load_camels_ch, load_ukraine_csv, make_hydrology_data
+from .hydrology_extreme_comparison import (
+    ENSEMBLE_APPROACHES,
+    ExtremeComparisonConfig,
+    ExtremeEnsembleRecord,
+    compare_extreme_event_ensembles,
+)
 from .hydrology_complexity import (
     HydrologyComplexityEstimator,
     LyapunovComplexityEstimator,
@@ -20,6 +26,9 @@ from .pinnmamba import PINNMamba, PINNMambaExpert, evaluate_reaction_pinnmamba
 
 __all__ = [
     "FourierExpert",
+    "ENSEMBLE_APPROACHES",
+    "ExtremeComparisonConfig",
+    "ExtremeEnsembleRecord",
     "HydrologyPINNMambaExpert",
     "HydrologyComplexityEstimator",
     "LearnedHydrologyMorsePotential",
@@ -36,6 +45,7 @@ __all__ = [
     "TakensPersistenceEstimator",
     "build_expert",
     "build_hydrology_complexity_estimator",
+    "compare_extreme_event_ensembles",
     "evaluate_reaction_pinnmamba",
     "load_camels_ch",
     "load_ukraine_csv",
