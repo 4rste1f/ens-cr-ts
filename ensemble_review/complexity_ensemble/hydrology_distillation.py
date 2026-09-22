@@ -385,8 +385,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--period", action="append", type=_parse_period)
     parser.add_argument("--without-landcover", action="store_true")
     parser.add_argument("--sequence-length", type=int, default=30)
-    parser.add_argument("--simple", choices=("rbf", "fourier"), default="fourier")
-    parser.add_argument("--complex", choices=("mlp", "pinnmamba"), default="pinnmamba")
+    parser.add_argument("--simple", choices=("rbf", "fourier"), default="rbf")
+    parser.add_argument("--complex", choices=("mlp", "pinnmamba"), default="mlp")
     parser.add_argument("--models", default="morse,learned,single_complex")
     parser.add_argument("--seeds", default="0")
     parser.add_argument(
