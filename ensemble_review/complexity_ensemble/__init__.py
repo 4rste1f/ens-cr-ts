@@ -23,6 +23,23 @@ from .hydrology_complexity import (
 )
 from .routing import LearnedRouter, MorseRouter, ScoreRouter
 from .pinnmamba import PINNMamba, PINNMambaExpert, evaluate_reaction_pinnmamba
+from .regional import (
+    BasinScopeConfig,
+    CAMELSCHCatalog,
+    CancellationToken,
+    DateRange,
+    DateSplitConfig,
+    ExperimentResult,
+    ExtremeEventConfig,
+    HyperparameterConfig,
+    ModelArchitectureConfig,
+    PhysicsModelConfig,
+    RegionalExperimentConfig,
+    TrainingStrategyConfig,
+    make_regional_hydrology_data,
+    run_regional_experiment,
+    write_result_artifacts,
+)
 
 __all__ = [
     "FourierExpert",
@@ -50,5 +67,20 @@ __all__ = [
     "load_camels_ch",
     "load_ukraine_csv",
     "make_hydrology_data",
+    "make_regional_hydrology_data",
+    "BasinScopeConfig",
+    "CAMELSCHCatalog",
+    "CancellationToken",
+    "DateRange",
+    "DateSplitConfig",
+    "ExperimentResult",
+    "ExtremeEventConfig",
+    "HyperparameterConfig",
+    "ModelArchitectureConfig",
+    "PhysicsModelConfig",
+    "RegionalExperimentConfig",
+    "TrainingStrategyConfig",
+    "run_regional_experiment",
+    "write_result_artifacts",
     "takens_delay_embedding",
 ]
