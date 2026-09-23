@@ -274,6 +274,8 @@ def _config_from_ui_values(data_root: str | Path, target_values, scope_value, va
             int(values[10]), _parse_seeds(values[11]), int(values[12]), float(values[13]),
             float(values[14]), float(values[15]), float(values[16]), float(values[17]),
             float(values[18]), float(values[29]), float(values[30]), values[31],
+            float(values[34]) if len(values) > 34 else 0.99,
+            float(values[35]) if len(values) > 35 else 0.1,
         ),
         PhysicsModelConfig(),
         ExtremeEventConfig(values[28], values[32],
@@ -320,7 +322,15 @@ def build_app(data_root: str | Path):
                 train_start=gr.Textbox("2010-01-01",label="Train start"); train_end=gr.Textbox("2016-08-06",label="Train end")
                 val_start=gr.Textbox("2016-08-07",label="Validation start"); val_end=gr.Textbox("2018-10-18",label="Validation end")
                 test_start=gr.Textbox("2018-10-19",label="Test start"); test_end=gr.Textbox("2020-12-31",label="Test end")
-            approach=gr.Radio([("Soft routing","soft_routing"),("Hard routing","hard_routing"),("Distillation","distillation")],value="soft_routing",label="Approach")
+            approach=gr.Radio([
+                ("Soft routing","soft_routing"),
+                ("Hard routing","hard_routing"),
+                ("Distillation","distillation"),
+                ("No routing — complex only","no_routing"),
+                ("Static 50/50 — independently trained","static_50_50"),
+                ("OOD fallback — simple when OOD","ood_fallback"),
+                ("Stacking — validation-optimized blend","stacking"),
+            ],value="soft_routing",label="Approach")
             complex_expert=gr.Radio([("Mamba","pinnmamba"),("MLP","mlp")],value="pinnmamba",label="Complex expert")
             simple_expert=gr.Radio([("RBF","rbf"),("Fourier","fourier")],value="rbf",label="Simple expert")
             gr.Dropdown([("Linear reservoir water balance","linear_reservoir")],value="linear_reservoir",label="Physics model",interactive=False)
@@ -342,6 +352,8 @@ def build_app(data_root: str | Path):
                 mamba_hidden=gr.Number(16,precision=0,label="Mamba hidden size"); mamba_layers=gr.Number(1,precision=0,label="Mamba layers")
                 mamba_ff=gr.Number(64,precision=0,label="Mamba feed-forward size")
                 rbf_centers=gr.Number(32,precision=0,label="RBF centers"); fourier_frequencies=gr.Number(32,precision=0,label="Fourier frequencies")
+                ood_quantile=gr.Number(.99,label="OOD training-score quantile")
+                ood_shrinkage=gr.Number(.1,label="OOD covariance shrinkage")
         with gr.Tab("Extreme events"):
             extreme_mode=gr.Radio([("None","none"),("Statistical","statistical"),("Structural — coming soon","structural")],value="none",label="Mode")
             definition=gr.Radio([("Automatic per-basin Q95","automatic_q95"),("Manual absolute discharge","absolute"),("Manual quantile","quantile")],value="automatic_q95",label="Definition")
@@ -446,7 +458,7 @@ def build_app(data_root: str | Path):
         def refresh_result_views(basin, result):
             return refresh_result(basin, result)[1:]
 
-        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value]
+        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage]
         prepare = run.click(lambda: CancellationToken(), outputs=token_state, queue=False)
         prepare.then(execute, inputs=[targets, scope, token_state, *inputs[2:]],
             outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,

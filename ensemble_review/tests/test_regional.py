@@ -50,7 +50,10 @@ def test_all_strategies_run_on_synthetic_regional_data():
         BasinCatalogRecord(key, key, {"height": index})
         for index, key in enumerate(series)
     ])
-    for approach in ("soft_routing", "hard_routing", "distillation"):
+    for approach in (
+        "soft_routing", "hard_routing", "distillation", "no_routing",
+        "static_50_50", "ood_fallback",
+    ):
         config = RegionalExperimentConfig(".", BasinScopeConfig(("target",), "exclude_targets"),
             _dates(), ModelArchitectureConfig(complex_expert="mlp", simple_expert="fourier",
                 mlp_widths=(8,), fourier_frequencies=4),
@@ -61,6 +64,12 @@ def test_all_strategies_run_on_synthetic_regional_data():
         assert result.predictions and not result.failures
         assert set(result.per_basin_metrics) == {"target"}
         assert result.extreme_events
+        if approach == "no_routing":
+            assert result.routing_diagnostics["mean_complex_weight"] == 1.0
+        elif approach == "static_50_50":
+            assert result.routing_diagnostics["mean_complex_weight"] == 0.5
+        elif approach == "ood_fallback":
+            assert "ood_fraction" in result.routing_diagnostics
 
 
 def test_pre_cancelled_run_returns_partial_result():
@@ -73,6 +82,39 @@ def test_pre_cancelled_run_returns_partial_result():
     result = run_regional_experiment(config, cancellation_token=token,
                                      catalog=catalog, series_by_basin=series)
     assert result.cancelled and not result.predictions
+
+
+def test_stacking_uses_target_validation_after_target_training():
+    series = {"a": _series("a"), "target": _series("target", .4)}
+    catalog = CAMELSCHCatalog(".", [BasinCatalogRecord(key) for key in series])
+    config = RegionalExperimentConfig(
+        ".",
+        BasinScopeConfig(("target",), "all_basins"),
+        _dates(),
+        ModelArchitectureConfig(
+            complex_expert="mlp", simple_expert="fourier",
+            mlp_widths=(8,), fourier_frequencies=4,
+        ),
+        TrainingStrategyConfig("stacking", 1, 1, 1, 1),
+        HyperparameterConfig(sequence_length=7, batch_size=128),
+    )
+
+    result = run_regional_experiment(config, catalog=catalog, series_by_basin=series)
+
+    weight = result.routing_diagnostics["fitted_complex_weight"]
+    assert 0.0 <= weight <= 1.0
+    assert result.routing_diagnostics["stacking_calibration_scope"] == "pooled_target_validation"
+    assert result.resolved_config["fitted_diagnostics"] == result.routing_diagnostics
+
+
+def test_stacking_rejects_excluded_target_training_scope():
+    config = RegionalExperimentConfig(
+        ".", BasinScopeConfig(("target",), "exclude_targets"), _dates(),
+        strategy=TrainingStrategyConfig(approach="stacking"),
+    )
+
+    with pytest.raises(ValueError, match="requires target basins in training"):
+        config.validate()
 
 
 def test_gradio_values_map_to_the_correct_configuration_fields():

@@ -27,6 +27,8 @@ from .hydrology_comparison import _add_observation_noise, _metrics
 from .hydrology_data import HydrologySeries, load_camels_ch
 from .hydrology_extreme_comparison import extreme_metrics
 from .hydrology_hard_routing_consolidation_comparison import hard_routed_losses
+from .ood import MahalanobisOODDetector
+from .stacking import fit_convex_stacking_weight
 
 
 TRAINING_SCOPES = ("exclude_targets", "all_basins", "targets_only")
@@ -35,7 +37,10 @@ _SCOPE_ALIASES = {
     "all_basins": "all_basins", "all": "all_basins",
     "targets_only": "targets_only", "selected_only": "targets_only",
 }
-TRAINING_APPROACHES = ("soft_routing", "hard_routing", "distillation")
+TRAINING_APPROACHES = (
+    "soft_routing", "hard_routing", "distillation", "no_routing",
+    "static_50_50", "ood_fallback", "stacking",
+)
 PHYSICS_MODELS = ("linear_reservoir",)
 PHYSICS_MODEL_REGISTRY = {"linear_reservoir": "linear reservoir water balance"}
 
@@ -109,6 +114,8 @@ class HyperparameterConfig:
     routing_weight: float = 0.05
     compute_weight: float = 0.0
     device: str = "cpu"
+    ood_quantile: float = 0.99
+    ood_shrinkage: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -152,6 +159,13 @@ class RegionalExperimentConfig:
             raise ValueError("simple_expert must be 'rbf' or 'fourier'")
         if self.strategy.approach not in TRAINING_APPROACHES:
             raise ValueError(f"approach must be one of {TRAINING_APPROACHES}")
+        if (
+            self.strategy.approach == "stacking"
+            and _SCOPE_ALIASES[self.basins.training_scope] == "exclude_targets"
+        ):
+            raise ValueError(
+                "stacking requires target basins in training; choose all_basins or targets_only"
+            )
         epochs = (self.strategy.epochs, self.strategy.complex_teacher_epochs,
                   self.strategy.distillation_epochs, self.strategy.consolidation_epochs)
         hp = self.hyperparameters
@@ -165,6 +179,8 @@ class RegionalExperimentConfig:
             raise ValueError("noise and loss weights must be non-negative")
         if not 0 < hp.complexity_percentile < 100 or hp.gate_temperature <= 0:
             raise ValueError("complexity percentile and gate temperature are invalid")
+        if not 0 < hp.ood_quantile < 1 or not 0 <= hp.ood_shrinkage <= 1:
+            raise ValueError("OOD quantile or covariance shrinkage is invalid")
         if self.physics.name not in PHYSICS_MODELS:
             raise ValueError(f"physics model must be one of {PHYSICS_MODELS}")
         if self.extremes.mode not in {"none", "statistical"}:
@@ -505,6 +521,8 @@ class PredictionRecord:
     predicted_mm_day: float
     complex_weight: float
     physics_error: float = float("nan")
+    ood_score: float = float("nan")
+    ood_threshold: float = float("nan")
 
 
 @dataclass
@@ -512,7 +530,7 @@ class ExperimentResult:
     predictions: list[PredictionRecord]
     aggregate_metrics: dict[str, float]
     per_basin_metrics: dict[str, dict[str, float]]
-    routing_diagnostics: dict[str, float]
+    routing_diagnostics: dict[str, object]
     loss_traces: dict[str, list[float]]
     extreme_events: list[dict[str, object]]
     failures: list[str]
@@ -561,7 +579,8 @@ def _train(
     hp, strategy = config.hyperparameters, config.strategy
     inputs, physical = split.inputs.to(device), split.physical_inputs.to(device)
     static, targets = split.static_inputs.to(device), split.targets.to(device)
-    model.fit_router(inputs)
+    if strategy.approach in {"soft_routing", "hard_routing", "distillation"}:
+        model.fit_router(inputs)
     generator = torch.Generator(device=device).manual_seed(seed + 104729)
 
     def batches(epoch: int):
@@ -608,6 +627,52 @@ def _train(
                          f"seed {seed}: {phase} epoch {epoch + 1}/{epochs}")
 
     config_data_names = feature_names
+    if strategy.approach in {"no_routing", "static_50_50", "ood_fallback", "stacking"}:
+        parameters = [*model.complex_expert.parameters(), model.raw_response, model.raw_recession]
+        if strategy.approach != "no_routing":
+            parameters.extend(model.simple_expert.parameters())
+        optimizer = torch.optim.Adam(parameters, lr=hp.learning_rate)
+        for epoch in range(strategy.epochs):
+            if _cancelled(token):
+                return
+            total = 0.0
+            for indices in batches(epoch):
+                if _cancelled(token):
+                    return
+                noisy = _add_observation_noise(
+                    inputs[indices], config_data_names, hp.training_noise, generator
+                )
+                optimizer.zero_grad()
+                complex_prediction = model._positive_discharge(
+                    model.complex_expert(noisy, static[indices])
+                )
+                complex_loss = (
+                    (complex_prediction.squeeze(-1) - targets[indices]).square().mean()
+                    + hp.physics_weight
+                    * model.physics_residual(complex_prediction, physical[indices]).square().mean()
+                )
+                if strategy.approach == "no_routing":
+                    loss = complex_loss
+                else:
+                    simple_prediction = model._positive_discharge(
+                        model.simple_expert(noisy, static[indices])
+                    )
+                    simple_loss = (
+                        (simple_prediction.squeeze(-1) - targets[indices]).square().mean()
+                        + hp.physics_weight
+                        * model.physics_residual(simple_prediction, physical[indices]).square().mean()
+                    )
+                    loss = 0.5 * (simple_loss + complex_loss)
+                loss.backward()
+                optimizer.step()
+                total += float(loss.detach()) * len(indices)
+            traces.setdefault(strategy.approach, []).append(total / len(inputs))
+            if progress:
+                progress(
+                    (seed_index + (epoch + 1) / strategy.epochs) / seed_count,
+                    f"seed {seed}: {strategy.approach} epoch {epoch + 1}/{strategy.epochs}",
+                )
+        return
     if strategy.approach in {"soft_routing", "hard_routing"}:
         run_joint(strategy.epochs, strategy.approach, strategy.approach == "hard_routing")
         return
@@ -719,6 +784,9 @@ def run_regional_experiment(
                                         sequence_length=config.hyperparameters.sequence_length)
     resolved = _resolved(config, data)
     traces: dict[str, list[float]] = {}; predictions: list[PredictionRecord] = []
+    ood_thresholds: list[float] = []
+    stacking_weights: list[float] = []
+    stacking_validation_mses: list[float] = []
     failures = load_failures
     device = torch.device(config.hyperparameters.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -737,16 +805,87 @@ def run_regional_experiment(
                 gate_temperature=config.hyperparameters.gate_temperature,
                 simple_kwargs=simple_kwargs, complex_kwargs=complex_kwargs,
                 static_dim=data.train.static_inputs.shape[1]).to(device)
-            parameter_count = sum(item.numel() for item in model.parameters() if item.requires_grad)
+            if config.strategy.approach == "no_routing":
+                parameter_count = sum(
+                    item.numel() for item in (
+                        *model.complex_expert.parameters(), model.raw_response, model.raw_recession
+                    )
+                )
+            else:
+                parameter_count = sum(item.numel() for item in model.parameters() if item.requires_grad)
             _train(model, data.train, config, seed, device, progress_callback,
                    cancellation_token, traces, seed_index, len(config.hyperparameters.seeds),
                    data.feature_names)
             if _cancelled(cancellation_token): break
             model.eval()
             with torch.no_grad():
-                output = model(data.test.inputs.to(device), return_details=True,
-                               static_inputs=data.test.static_inputs.to(device),
-                               hard=config.strategy.approach == "hard_routing")
+                test_inputs = data.test.inputs.to(device)
+                test_static = data.test.static_inputs.to(device)
+                if config.strategy.approach in {
+                    "no_routing", "static_50_50", "ood_fallback", "stacking"
+                }:
+                    complex_raw = model.complex_expert(test_inputs, test_static)
+                    complex_prediction = model._positive_discharge(complex_raw)
+                    ood_score = torch.full(
+                        (len(test_inputs),), float("nan"), device=device
+                    )
+                    seed_ood_threshold = float("nan")
+                    if config.strategy.approach == "no_routing":
+                        simple_raw = torch.zeros_like(complex_raw)
+                        simple_prediction = torch.zeros_like(complex_prediction)
+                        weight = torch.ones(len(test_inputs), device=device)
+                    else:
+                        simple_raw = model.simple_expert(test_inputs, test_static)
+                        simple_prediction = model._positive_discharge(simple_raw)
+                        if config.strategy.approach == "static_50_50":
+                            weight = torch.full((len(test_inputs),), 0.5, device=device)
+                        elif config.strategy.approach == "stacking":
+                            validation_inputs = data.validation.inputs.to(device)
+                            validation_static = data.validation.static_inputs.to(device)
+                            validation_simple = model._positive_discharge(
+                                model.simple_expert(validation_inputs, validation_static)
+                            )
+                            validation_complex = model._positive_discharge(
+                                model.complex_expert(validation_inputs, validation_static)
+                            )
+                            fitted_weight, validation_mse = fit_convex_stacking_weight(
+                                validation_simple,
+                                validation_complex,
+                                data.validation.targets.to(device),
+                            )
+                            weight = torch.full(
+                                (len(test_inputs),), fitted_weight, device=device
+                            )
+                            stacking_weights.append(fitted_weight)
+                            stacking_validation_mses.append(
+                                validation_mse * float(data.discharge_scale.square())
+                            )
+                        else:
+                            detector = MahalanobisOODDetector(
+                                config.hyperparameters.ood_quantile,
+                                config.hyperparameters.ood_shrinkage,
+                            ).fit(
+                                data.train.inputs.to(device), data.train.static_inputs.to(device)
+                            )
+                            ood_score = detector.score(test_inputs, test_static)
+                            weight = (~detector.is_ood(test_inputs, test_static)).to(test_inputs.dtype)
+                            assert detector.threshold is not None
+                            seed_ood_threshold = float(detector.threshold.cpu())
+                            ood_thresholds.append(seed_ood_threshold)
+                    discharge = torch.lerp(
+                        simple_prediction, complex_prediction, weight[:, None]
+                    )
+                    output = HydrologyRoutedOutput(
+                        discharge, weight, simple_raw, complex_raw
+                    )
+                else:
+                    ood_score = torch.full(
+                        (len(test_inputs),), float("nan"), device=device
+                    )
+                    seed_ood_threshold = float("nan")
+                    output = model(test_inputs, return_details=True,
+                                   static_inputs=test_static,
+                                   hard=config.strategy.approach == "hard_routing")
             assert isinstance(output, HydrologyRoutedOutput)
             predicted = output.discharge.squeeze(-1).cpu() * data.discharge_scale
             observed = data.test.targets * data.discharge_scale
@@ -756,7 +895,8 @@ def run_regional_experiment(
             for index in range(len(predicted)):
                 predictions.append(PredictionRecord(seed, data.test.basin_ids[index],
                     data.test.target_dates[index], float(observed[index]), float(predicted[index]),
-                    float(output.complex_weight[index].cpu()), float(residual[index])))
+                    float(output.complex_weight[index].cpu()), float(residual[index]),
+                    float(ood_score[index].cpu()), seed_ood_threshold))
         except Exception as error:
             failures.append(f"seed {seed}: {error}")
     per_basin: dict[str, dict[str, float]] = {}
@@ -774,7 +914,23 @@ def run_regional_experiment(
             "physics_error": sum(item.physics_error for item in predictions)/len(predictions),
         }
         routing = {"mean_complex_weight": sum(item.complex_weight for item in predictions)/len(predictions)}
+        finite_ood = [item.ood_score for item in predictions if math.isfinite(item.ood_score)]
+        if finite_ood:
+            routing.update({
+                "mean_ood_score": sum(finite_ood) / len(finite_ood),
+                "ood_fraction": sum(item.complex_weight < 0.5 for item in predictions) / len(predictions),
+                "mean_ood_threshold": sum(ood_thresholds) / len(ood_thresholds),
+            })
+        if stacking_weights:
+            routing.update({
+                "fitted_complex_weight": sum(stacking_weights) / len(stacking_weights),
+                "stacking_validation_mse_mm2_day2": (
+                    sum(stacking_validation_mses) / len(stacking_validation_mses)
+                ),
+                "stacking_calibration_scope": "pooled_target_validation",
+            })
     else: aggregate, routing = {}, {}
+    resolved["fitted_diagnostics"] = dict(routing)
     extremes = []
     for basin, threshold in _thresholds(config.extremes, data.target_basins, series, config.dates.train).items():
         rows = [item for item in predictions if item.basin_id == basin]
@@ -797,7 +953,7 @@ def write_result_artifacts(result: ExperimentResult, directory: str | Path | Non
     root = Path(directory or tempfile.mkdtemp(prefix="regional-hydrology-")); root.mkdir(parents=True, exist_ok=True)
     predictions_path, metrics_path, config_path = root/"predictions.csv", root/"metrics.csv", root/"config.json"
     with predictions_path.open("w", newline="", encoding="utf-8") as target:
-        writer = csv.DictWriter(target, fieldnames=("seed","basin_id","target_date","observed_mm_day","predicted_mm_day","complex_weight","physics_error")); writer.writeheader()
+        writer = csv.DictWriter(target, fieldnames=("seed","basin_id","target_date","observed_mm_day","predicted_mm_day","complex_weight","physics_error","ood_score","ood_threshold")); writer.writeheader()
         for item in result.predictions:
             row = asdict(item); row["target_date"] = item.target_date.isoformat(); writer.writerow(row)
     with metrics_path.open("w", newline="", encoding="utf-8") as target:

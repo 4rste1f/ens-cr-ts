@@ -61,7 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--approaches",
         type=_csv_strings,
         default=ENSEMBLE_APPROACHES,
-        help="Comma-separated: soft_routing,hard_routing,distillation",
+        help=(
+            "Comma-separated: soft_routing,hard_routing,distillation,no_routing,"
+            "static_50_50,ood_fallback,stacking"
+        ),
     )
     parser.add_argument("--routing", choices=("morse", "learned"), default="morse")
     parser.add_argument("--simple", choices=("rbf", "fourier"), default="rbf")
@@ -72,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--epochs",
         type=int,
         default=150,
-        help="Epochs for each soft- and hard-routing run",
+        help="Epochs for routing and independently trained ensemble approaches",
     )
     parser.add_argument("--complex-epochs", type=int, default=150)
     parser.add_argument("--distillation-epochs", type=int, default=150)
@@ -80,16 +83,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--training-noise", type=float, default=0.0)
-    parser.add_argument("--consolidation-weight", type=float, default=0.2)
+    parser.add_argument("--inference-noise", type=float, default=0.0)
+    parser.add_argument("--consolidation-weight", type=float, default=0.0)
     parser.add_argument("--complexity-percentile", type=float, default=80.0)
     parser.add_argument("--gate-temperature", type=float, default=0.15)
+    parser.add_argument("--ood-quantile", type=float, default=0.99)
+    parser.add_argument("--ood-shrinkage", type=float, default=0.1)
     parser.add_argument(
         "--hard-inference",
         action="store_true",
         help="Use binary routing at inference for the hard-routing approach",
     )
     parser.add_argument("--without-baselines", action="store_true")
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="cuda")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument(
         "--output",
@@ -116,11 +122,14 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         training_noise=args.training_noise,
+        inference_noise=args.inference_noise,
         consolidation_weight=args.consolidation_weight,
         complexity_percentile=args.complexity_percentile,
         gate_temperature=args.gate_temperature,
         hard_inference=args.hard_inference,
         include_baselines=not args.without_baselines,
+        ood_quantile=args.ood_quantile,
+        ood_shrinkage=args.ood_shrinkage,
     )
     try:
         config.validate()
