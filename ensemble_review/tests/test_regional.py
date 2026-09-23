@@ -1,9 +1,10 @@
 from datetime import date, timedelta
 import csv
 
+import pytest
 import torch
 
-from complexity_ensemble.app import DEFAULT_BASINS, _config_from_ui_values
+from complexity_ensemble.app import BasinMapComponent, DEFAULT_BASINS, _config_from_ui_values
 from complexity_ensemble.hydrology_data import HydrologySeries
 from complexity_ensemble.regional import (
     BasinCatalogRecord, BasinScopeConfig, CAMELSCHCatalog, CancellationToken,
@@ -97,6 +98,60 @@ def test_established_basin_set_is_the_application_default():
         "4009", "4008", "2488", "2109", "2011", "2126", "5001", "2247",
         "4022", "4023", "5009", "5010", "5016", "3014", "3015",
     )
+
+
+def test_basin_map_payload_contains_geojson_and_selection_state():
+    class Geometry:
+        area = 2.0
+        __geo_interface__ = {
+            "type": "Polygon",
+            "coordinates": (((7.0, 46.0), (8.0, 46.0), (8.0, 47.0), (7.0, 46.0)),),
+        }
+
+    catalog = CAMELSCHCatalog(".", [
+        BasinCatalogRecord("a", "Alpha", eligible=True, geometry=Geometry()),
+        BasinCatalogRecord("b", "Beta", eligible=False),
+    ])
+    payload = BasinMapComponent(catalog).payload(
+        ["a"], active="a", training=["a"], interaction="toggle"
+    )
+    assert payload["selected"] == ["a"]
+    assert payload["eligible"] == ["a"]
+    assert payload["active"] == "a"
+    assert payload["interaction"] == "toggle"
+    assert payload["geojson"]["features"][0]["properties"] == {
+        "basin_id": "a", "name": "Alpha", "eligible": True,
+    }
+    assert payload["geojson"]["features"][0]["geometry"]["type"] == "Polygon"
+
+
+def test_catalog_joins_numeric_shapefile_gauge_ids(tmp_path, monkeypatch):
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Polygon
+
+    observed = tmp_path / "timeseries" / "observation_based"
+    simulated = tmp_path / "timeseries" / "simulation_based"
+    shapes = tmp_path / "catchment_delineations"
+    observed.mkdir(parents=True); simulated.mkdir(parents=True); shapes.mkdir()
+    (observed / "CAMELS_CH_obs_based_4009.csv").touch()
+    (simulated / "CAMELS_CH_sim_based_4009.csv").touch()
+    shape_path = shapes / "CAMELS_CH_catchments.shp"
+    shape_path.touch()
+    frame = geopandas.GeoDataFrame(
+        {"gauge_id": [4009.0]},
+        geometry=[Polygon([
+            (2_600_000, 1_200_000), (2_601_000, 1_200_000),
+            (2_601_000, 1_201_000), (2_600_000, 1_200_000),
+        ])],
+        crs="EPSG:2056",
+    )
+    monkeypatch.setattr(geopandas, "read_file", lambda path: frame)
+
+    record = CAMELSCHCatalog(tmp_path).get("4009")
+    assert record.geometry is not None
+    minx, miny, maxx, maxy = record.geometry.bounds
+    assert 5 < minx < maxx < 11
+    assert 45 < miny < maxy < 48
 
 
 def test_regional_catalog_does_not_require_optional_annual_landcover(tmp_path):

@@ -197,6 +197,18 @@ _LEAKAGE_WORDS = (
 )
 
 
+def _normalize_basin_id(value: object) -> str:
+    """Normalize identifiers read as either text or spreadsheet-style numbers."""
+    text = str(value).strip()
+    try:
+        numeric = float(text)
+    except ValueError:
+        return text
+    if math.isfinite(numeric) and numeric.is_integer():
+        return str(int(numeric))
+    return text
+
+
 class CAMELSCHCatalog:
     """Catalog joining local CAMELS-CH series, metadata, attributes, and polygons."""
 
@@ -233,9 +245,9 @@ class CAMELSCHCatalog:
             except (OSError, UnicodeError, csv.Error):
                 continue
             for row in rows:
-                identifier = next((str(row[key]).strip() for key in row if key.lower() in {
+                identifier = next((_normalize_basin_id(row[key]) for key in row if key.lower() in {
                     "gauge_id", "station_id", "basin_id", "id", "gauge_code"
-                } and str(row[key]).strip() in basin_ids), None)
+                } and _normalize_basin_id(row[key]) in basin_ids), None)
                 if identifier is None:
                     continue
                 for key, raw in row.items():
@@ -253,14 +265,42 @@ class CAMELSCHCatalog:
         geometry: dict[str, object] = {}
         try:
             import geopandas as gpd
-            shape = next(iter(self.root.rglob("*.shp")), None)
+            preferred = self.root / "catchment_delineations" / "CAMELS_CH_catchments.shp"
+            shape = preferred if preferred.is_file() else next(
+                (path for path in self.root.rglob("*.shp")
+                 if "catchment" in path.stem.lower()
+                 and "sub_catchment" not in path.stem.lower()
+                 and "station" not in path.stem.lower()),
+                None,
+            )
             if shape is not None:
                 frame = gpd.read_file(shape)
+                # Browser mapping libraries consume longitude/latitude GeoJSON.
+                # CAMELS-CH releases commonly store catchments in a projected
+                # Swiss CRS, so normalize geometries while the source CRS is
+                # still available on the GeoDataFrame.
+                if frame.crs is not None:
+                    frame = frame.to_crs(epsg=4326)
+                # Catchment boundaries are much more detailed than a browser
+                # map at national scale can display. Keeping the source
+                # vertices made each Gradio map payload well over 100 MB.
+                # This only affects catalog display geometry; model inputs and
+                # all hydrological calculations remain unchanged.
+                frame.geometry = frame.geometry.simplify(
+                    tolerance=0.002, preserve_topology=True
+                )
                 id_column = next((column for column in frame.columns if column.lower() in {
                     "gauge_id", "station_id", "basin_id", "id", "gauge_code"
                 }), None)
                 if id_column:
-                    geometry = {str(row[id_column]): row.geometry for _, row in frame.iterrows()}
+                    name_column = next((column for column in frame.columns if column.lower() in {
+                        "name", "station_name", "gauge_name"
+                    }), None)
+                    for _, row in frame.iterrows():
+                        identifier = _normalize_basin_id(row[id_column])
+                        geometry[identifier] = row.geometry
+                        if name_column and str(row[name_column]).strip():
+                            names[identifier] = str(row[name_column]).strip().replace("_", " ")
         except (ImportError, OSError, ValueError):
             pass
         simulated = self.root / "timeseries" / "simulation_based"
