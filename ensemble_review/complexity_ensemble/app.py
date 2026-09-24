@@ -254,6 +254,11 @@ def _parse_seeds(value: str) -> tuple[int, ...]:
     except ValueError as error: raise ValueError("seeds must be comma-separated integers") from error
 
 
+def _parse_floats(value: str) -> tuple[float, ...]:
+    try: return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error: raise ValueError("values must be comma-separated numbers") from error
+
+
 def _config_from_ui_values(data_root: str | Path, target_values, scope_value, values):
     """Translate the ordered Gradio component values into the typed service config."""
     widths = tuple(int(item.strip()) for item in values[22].split(",") if item.strip())
@@ -277,7 +282,24 @@ def _config_from_ui_values(data_root: str | Path, target_values, scope_value, va
             float(values[34]) if len(values) > 34 else 0.99,
             float(values[35]) if len(values) > 35 else 0.1,
         ),
-        PhysicsModelConfig(),
+        PhysicsModelConfig(
+            optimization_mode=values[36] if len(values) > 36 else "none",
+            distillation_teacher=values[37] if len(values) > 37 else "hard_routing",
+            kan_candidates=int(values[38]) if len(values) > 38 else 3,
+            kan_steps=int(values[39]) if len(values) > 39 else 50,
+            kan_grid=int(values[40]) if len(values) > 40 else 3,
+            kan_spline_order=int(values[41]) if len(values) > 41 else 3,
+            kan_additive_nodes=int(values[42]) if len(values) > 42 else 2,
+            kan_multiplicative_nodes=int(values[43]) if len(values) > 43 else 1,
+            kan_sparsity_weight=float(values[44]) if len(values) > 44 else 1e-3,
+            robustness_noise_levels=(
+                _parse_floats(values[45]) if len(values) > 45 else (0.05, 0.1, 0.2)
+            ),
+            robustness_accuracy_tolerance=(
+                float(values[46]) if len(values) > 46 else 0.05
+            ),
+            symbolic=bool(values[47]) if len(values) > 47 else True,
+        ),
         ExtremeEventConfig(values[28], values[32],
                            float(values[33]) if values[33] is not None else None),
     )
@@ -333,7 +355,23 @@ def build_app(data_root: str | Path):
             ],value="soft_routing",label="Approach")
             complex_expert=gr.Radio([("Mamba","pinnmamba"),("MLP","mlp")],value="pinnmamba",label="Complex expert")
             simple_expert=gr.Radio([("RBF","rbf"),("Fourier","fourier")],value="rbf",label="Simple expert")
-            gr.Dropdown([("Linear reservoir water balance","linear_reservoir")],value="linear_reservoir",label="Physics model",interactive=False)
+            gr.Dropdown([("Linear reservoir water balance","linear_reservoir")],value="linear_reservoir",label="Physics backbone",interactive=False)
+            physics_optimization=gr.Radio([
+                ("Linear reservoir only", "none"),
+                ("KAN — maximum accuracy", "accuracy"),
+                ("KAN — maximum robustness", "robustness"),
+                ("KAN — balanced", "balanced"),
+                ("KAN — physics distillation", "distillation"),
+            ], value="none", label="Physics optimization")
+            physics_teacher=gr.Dropdown([
+                ("Morse soft routing", "soft_routing"),
+                ("Morse hard routing", "hard_routing"),
+                ("Existing expert distillation", "distillation"),
+                ("Complex expert only", "no_routing"),
+                ("Static 50/50", "static_50_50"),
+                ("OOD fallback", "ood_fallback"),
+                ("Validation stacking", "stacking"),
+            ], value="hard_routing", label="Physics-distillation teacher")
         with gr.Tab("Training hyperparameters"):
             with gr.Row():
                 sequence=gr.Number(30,precision=0,label="Sequence length"); seeds=gr.Textbox("0",label="Seeds")
@@ -342,18 +380,28 @@ def build_app(data_root: str | Path):
             with gr.Row():
                 percentile=gr.Number(80,label="Complexity percentile"); temperature=gr.Number(.15,label="Gate temperature")
                 physics_weight=gr.Number(.05,label="Physics weight"); interface_weight=gr.Number(.05,label="Interface weight")
-                routing_weight=gr.Number(.05,label="Routing weight"); compute_weight=gr.Number(0,label="Compute weight")
+                routing_weight=gr.Number(.2,label="Routing weight"); compute_weight=gr.Number(0,label="Compute weight")
             device=gr.Radio(["cpu","cuda"],value="cpu",label="Device")
             with gr.Accordion("Approach and architecture controls",open=False):
-                teacher_epochs=gr.Number(20,precision=0,label="Complex-teacher epochs")
-                distill_epochs=gr.Number(20,precision=0,label="Distillation epochs")
-                consolidation_epochs=gr.Number(20,precision=0,label="Consolidation epochs")
+                teacher_epochs=gr.Number(120,precision=0,label="Complex-teacher epochs")
+                distill_epochs=gr.Number(120,precision=0,label="Distillation epochs")
+                consolidation_epochs=gr.Number(120,precision=0,label="Consolidation epochs")
                 mlp_widths=gr.Textbox("64,64",label="MLP widths")
                 mamba_hidden=gr.Number(16,precision=0,label="Mamba hidden size"); mamba_layers=gr.Number(1,precision=0,label="Mamba layers")
                 mamba_ff=gr.Number(64,precision=0,label="Mamba feed-forward size")
                 rbf_centers=gr.Number(32,precision=0,label="RBF centers"); fourier_frequencies=gr.Number(32,precision=0,label="Fourier frequencies")
                 ood_quantile=gr.Number(.99,label="OOD training-score quantile")
                 ood_shrinkage=gr.Number(.1,label="OOD covariance shrinkage")
+                kan_candidates=gr.Number(3,precision=0,label="KAN candidate seeds")
+                kan_steps=gr.Number(50,precision=0,label="KAN training steps")
+                kan_grid=gr.Number(5,precision=0,label="KAN spline grid")
+                kan_order=gr.Number(5,precision=0,label="KAN spline order")
+                kan_additive=gr.Number(3,precision=0,label="KAN additive nodes")
+                kan_multiplicative=gr.Number(2,precision=0,label="KAN multiplication nodes")
+                kan_sparsity=gr.Number(1e-3,label="KAN sparsity weight")
+                kan_noise_levels=gr.Textbox("0.2",label="Robustness noise levels")
+                kan_accuracy_tolerance=gr.Number(.05,label="Robustness clean-AP tolerance")
+                kan_symbolic=gr.Checkbox(True,label="Extract symbolic KAN equation")
         with gr.Tab("Extreme events"):
             extreme_mode=gr.Radio([("None","none"),("Statistical","statistical"),("Structural — coming soon","structural")],value="none",label="Mode")
             definition=gr.Radio([("Automatic per-basin Q95","automatic_q95"),("Manual absolute discharge","absolute"),("Manual quantile","quantile")],value="automatic_q95",label="Definition")
@@ -417,7 +465,13 @@ def build_app(data_root: str | Path):
             points=go.Figure(); points.add_scatter(x=[x.observed_mm_day for x in rows],y=[x.predicted_mm_day for x in rows],mode="markers")
             route=go.Figure(); route.add_scatter(x=[x.target_date for x in rows],y=[x.complex_weight for x in rows],mode="lines",name="Complex weight")
             losses=go.Figure()
-            for phase, trace in result.loss_traces.items(): losses.add_scatter(y=trace,mode="lines+markers",name=phase)
+            for phase, trace in result.loss_traces.items():
+                standalone = phase.startswith("kan_standalone_")
+                losses.add_scatter(
+                    y=trace,
+                    mode="markers" if standalone else "lines+markers",
+                    name=phase,
+                )
             training=result.resolved_config["effective_training_basins"]
             return (
                 basin,
@@ -436,7 +490,7 @@ def build_app(data_root: str | Path):
                 result=run_regional_experiment(
                     config, lambda fraction,message: progress(fraction,desc=message), token
                 )
-            except (ValueError, FileNotFoundError) as error:
+            except (ValueError, FileNotFoundError, RuntimeError) as error:
                 raise gr.Error(str(error)) from error
             paths=write_result_artifacts(result)
             message="Cancelled; showing completed partial results." if result.cancelled else f"Completed in {result.runtime_seconds:.1f}s"
@@ -458,7 +512,7 @@ def build_app(data_root: str | Path):
         def refresh_result_views(basin, result):
             return refresh_result(basin, result)[1:]
 
-        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage]
+        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage,physics_optimization,physics_teacher,kan_candidates,kan_steps,kan_grid,kan_order,kan_additive,kan_multiplicative,kan_sparsity,kan_noise_levels,kan_accuracy_tolerance,kan_symbolic]
         prepare = run.click(lambda: CancellationToken(), outputs=token_state, queue=False)
         prepare.then(execute, inputs=[targets, scope, token_state, *inputs[2:]],
             outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,

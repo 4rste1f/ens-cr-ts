@@ -14,3 +14,4 @@ complexity-ensemble-app = "complexity_ensemble.app:main"
 
 [project.optional-dependencies]
 tda = ["ripser>=0.6"]
+kan = ["pykan>=0.2.8"]

@@ -9,7 +9,7 @@ from complexity_ensemble.hydrology_data import HydrologySeries
 from complexity_ensemble.regional import (
     BasinCatalogRecord, BasinScopeConfig, CAMELSCHCatalog, CancellationToken,
     DateRange, DateSplitConfig, ExtremeEventConfig, HyperparameterConfig,
-    ModelArchitectureConfig, RegionalExperimentConfig, TrainingStrategyConfig,
+    ModelArchitectureConfig, PhysicsModelConfig, RegionalExperimentConfig, TrainingStrategyConfig,
     make_regional_hydrology_data, run_regional_experiment,
 )
 
@@ -117,6 +117,46 @@ def test_stacking_rejects_excluded_target_training_scope():
         config.validate()
 
 
+def test_kan_physics_rejects_excluded_target_training_scope():
+    config = RegionalExperimentConfig(
+        ".", BasinScopeConfig(("target",), "exclude_targets"), _dates(),
+        physics=PhysicsModelConfig(optimization_mode="balanced"),
+    )
+
+    with pytest.raises(ValueError, match="requires target basins in training"):
+        config.validate()
+
+
+def test_numeric_kan_physics_distills_selected_teacher():
+    pytest.importorskip("kan")
+    series = {"target": _series("target")}
+    catalog = CAMELSCHCatalog(".", [BasinCatalogRecord("target")])
+    config = RegionalExperimentConfig(
+        ".", BasinScopeConfig(("target",), "targets_only"), _dates(),
+        ModelArchitectureConfig(
+            complex_expert="mlp", simple_expert="fourier",
+            mlp_widths=(8,), fourier_frequencies=4,
+        ),
+        TrainingStrategyConfig("static_50_50", 1, 1, 1, 1),
+        HyperparameterConfig(sequence_length=7, batch_size=128),
+        PhysicsModelConfig(
+            optimization_mode="distillation", distillation_teacher="hard_routing",
+            kan_candidates=1, kan_steps=1, symbolic=False,
+        ),
+    )
+
+    result = run_regional_experiment(config, catalog=catalog, series_by_basin=series)
+
+    assert result.predictions and not result.failures
+    assert result.routing_diagnostics["physics_distillation_teacher"] == "hard_routing"
+    assert result.routing_diagnostics["kan_selected_candidate_indices"] == [0]
+    assert "delta_q =" in result.routing_diagnostics["kan_selected_formulas"][0]
+    for split in ("train", "validation", "test"):
+        trace = result.loss_traces[f"kan_standalone_{split}_observation_mse"]
+        assert len(trace) == 1
+        assert torch.isfinite(torch.tensor(trace)).all()
+
+
 def test_gradio_values_map_to_the_correct_configuration_fields():
     values = [
         "2001-01-08", "2001-02-02", "2001-02-03", "2001-02-12",
@@ -133,6 +173,26 @@ def test_gradio_values_map_to_the_correct_configuration_fields():
     assert config.hyperparameters.compute_weight == 0.6
     assert config.extremes.mode == "statistical"
     assert config.extremes.value == 0.9
+
+
+def test_gradio_values_include_kan_physics_controls():
+    values = [
+        "2001-01-08", "2001-02-02", "2001-02-03", "2001-02-12",
+        "2001-02-13", "2001-03-01", "hard_routing", "mlp", "fourier",
+        3, 7, "4", 16, 0.002, 0.1, 75, 0.2, 0.3, 0.4,
+        6, 7, 8, "12,10", 14, 2, 48, 9, 11, "none",
+        0.5, 0.6, "cpu", "quantile", 0.9, 0.99, 0.1,
+        "distillation", "static_50_50", 4, 60, 5, 3, 3, 2, 0.002,
+        "0.03,0.1", 0.07, False,
+    ]
+
+    config = _config_from_ui_values("/data", ["target"], "targets_only", values)
+
+    assert config.physics.optimization_mode == "distillation"
+    assert config.physics.distillation_teacher == "static_50_50"
+    assert config.physics.kan_candidates == 4
+    assert config.physics.robustness_noise_levels == (0.03, 0.1)
+    assert config.physics.symbolic is False
 
 
 def test_established_basin_set_is_the_application_default():

@@ -14,7 +14,7 @@ import os
 import tempfile
 import time
 import zipfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from threading import Event
@@ -29,6 +29,10 @@ from .hydrology_extreme_comparison import extreme_metrics
 from .hydrology_hard_routing_consolidation_comparison import hard_routed_losses
 from .ood import MahalanobisOODDetector
 from .stacking import fit_convex_stacking_weight
+from .kan_physics import (
+    KANPhysicsSettings, PHYSICS_OPTIMIZATION_MODES, discover_kan_physics_correction,
+    standalone_kan_prediction,
+)
 
 
 TRAINING_SCOPES = ("exclude_targets", "all_basins", "targets_only")
@@ -121,6 +125,18 @@ class HyperparameterConfig:
 @dataclass(frozen=True)
 class PhysicsModelConfig:
     name: str = "linear_reservoir"
+    optimization_mode: str = "none"
+    distillation_teacher: str = "hard_routing"
+    kan_candidates: int = 3
+    kan_steps: int = 50
+    kan_grid: int = 3
+    kan_spline_order: int = 3
+    kan_additive_nodes: int = 2
+    kan_multiplicative_nodes: int = 1
+    kan_sparsity_weight: float = 1e-3
+    robustness_noise_levels: tuple[float, ...] = (0.05, 0.1, 0.2)
+    robustness_accuracy_tolerance: float = 0.05
+    symbolic: bool = True
 
 
 @dataclass(frozen=True)
@@ -183,6 +199,35 @@ class RegionalExperimentConfig:
             raise ValueError("OOD quantile or covariance shrinkage is invalid")
         if self.physics.name not in PHYSICS_MODELS:
             raise ValueError(f"physics model must be one of {PHYSICS_MODELS}")
+        if self.physics.optimization_mode not in ("none", *PHYSICS_OPTIMIZATION_MODES):
+            raise ValueError(
+                "physics optimization mode must be none, accuracy, robustness, balanced, "
+                "or distillation"
+            )
+        if (
+            self.physics.optimization_mode != "none"
+            and _SCOPE_ALIASES[self.basins.training_scope] == "exclude_targets"
+        ):
+            raise ValueError(
+                "KAN physics optimization requires target basins in training; choose "
+                "all_basins or targets_only"
+            )
+        if self.physics.distillation_teacher not in TRAINING_APPROACHES:
+            raise ValueError(f"distillation teacher must be one of {TRAINING_APPROACHES}")
+        if min(
+            self.physics.kan_candidates, self.physics.kan_steps, self.physics.kan_grid,
+            self.physics.kan_spline_order, self.physics.kan_additive_nodes,
+        ) < 1 or self.physics.kan_multiplicative_nodes < 0:
+            raise ValueError("KAN sizes, candidate count, and step count are invalid")
+        if self.physics.kan_sparsity_weight < 0 or not 0 <= self.physics.robustness_accuracy_tolerance <= 1:
+            raise ValueError("KAN sparsity and robustness tolerance are invalid")
+        if any(level <= 0 for level in self.physics.robustness_noise_levels):
+            raise ValueError("KAN robustness noise levels must be positive")
+        if (
+            self.physics.optimization_mode in {"robustness", "balanced"}
+            and not self.physics.robustness_noise_levels
+        ):
+            raise ValueError("robustness and balanced KAN modes require noise levels")
         if self.extremes.mode not in {"none", "statistical"}:
             raise ValueError("extreme mode must be 'none' or 'statistical'")
         if self.extremes.definition not in {"automatic_q95", "absolute", "quantile"}:
@@ -739,6 +784,56 @@ def _thresholds(config: ExtremeEventConfig, targets: tuple[str, ...],
     return result
 
 
+def _teacher_prediction(
+    model: RoutedHydrologyModel,
+    split: RegionalSplit,
+    approach: str,
+    device: torch.device,
+    *,
+    train_split: RegionalSplit,
+    validation_split: RegionalSplit,
+    ood_quantile: float,
+    ood_shrinkage: float,
+) -> torch.Tensor:
+    """Return a frozen approach's final normalized discharge prediction."""
+    inputs = split.inputs.to(device)
+    static = split.static_inputs.to(device)
+    with torch.no_grad():
+        if approach not in {"no_routing", "static_50_50", "ood_fallback", "stacking"}:
+            output = model(
+                inputs, static_inputs=static, return_details=True,
+                hard=approach == "hard_routing",
+            )
+            assert isinstance(output, HydrologyRoutedOutput)
+            return output.discharge.squeeze(-1)
+        complex_prediction = model._positive_discharge(model.complex_expert(inputs, static))
+        if approach == "no_routing":
+            return complex_prediction.squeeze(-1)
+        simple_prediction = model._positive_discharge(model.simple_expert(inputs, static))
+        if approach == "static_50_50":
+            weight = torch.full((len(inputs),), 0.5, device=device)
+        elif approach == "stacking":
+            validation_inputs = validation_split.inputs.to(device)
+            validation_static = validation_split.static_inputs.to(device)
+            validation_simple = model._positive_discharge(
+                model.simple_expert(validation_inputs, validation_static)
+            )
+            validation_complex = model._positive_discharge(
+                model.complex_expert(validation_inputs, validation_static)
+            )
+            fitted_weight, _ = fit_convex_stacking_weight(
+                validation_simple, validation_complex,
+                validation_split.targets.to(device),
+            )
+            weight = torch.full((len(inputs),), fitted_weight, device=device)
+        else:
+            detector = MahalanobisOODDetector(ood_quantile, ood_shrinkage).fit(
+                train_split.inputs.to(device), train_split.static_inputs.to(device)
+            )
+            weight = (~detector.is_ood(inputs, static)).to(inputs.dtype)
+        return torch.lerp(simple_prediction, complex_prediction, weight[:, None]).squeeze(-1)
+
+
 def _resolved(config: RegionalExperimentConfig, data: RegionalHydrologyData) -> dict[str, object]:
     value = asdict(config)
     value["data_root"] = str(config.data_root)
@@ -787,6 +882,9 @@ def run_regional_experiment(
     ood_thresholds: list[float] = []
     stacking_weights: list[float] = []
     stacking_validation_mses: list[float] = []
+    physics_formulas: list[str] = []
+    physics_candidate_metrics: list[list[dict[str, float]]] = []
+    physics_candidate_indices: list[int] = []
     failures = load_failures
     device = torch.device(config.hyperparameters.device)
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -798,13 +896,127 @@ def run_regional_experiment(
             torch.manual_seed(seed)
             simple_kwargs, complex_kwargs = _architecture_kwargs(config.model,
                 data.train.inputs.shape[1] * data.train.inputs.shape[2] + data.train.static_inputs.shape[1])
-            model = RoutedHydrologyModel(data.feature_names, data.train.inputs.shape[1],
-                data.discharge_scale, simple_kind=config.model.simple_expert,
-                complex_kind=config.model.complex_expert, routing="morse",
-                complexity_percentile=config.hyperparameters.complexity_percentile,
-                gate_temperature=config.hyperparameters.gate_temperature,
-                simple_kwargs=simple_kwargs, complex_kwargs=complex_kwargs,
-                static_dim=data.train.static_inputs.shape[1]).to(device)
+
+            def build_model() -> RoutedHydrologyModel:
+                return RoutedHydrologyModel(
+                    data.feature_names, data.train.inputs.shape[1], data.discharge_scale,
+                    simple_kind=config.model.simple_expert,
+                    complex_kind=config.model.complex_expert, routing="morse",
+                    complexity_percentile=config.hyperparameters.complexity_percentile,
+                    gate_temperature=config.hyperparameters.gate_temperature,
+                    simple_kwargs=simple_kwargs, complex_kwargs=complex_kwargs,
+                    static_dim=data.train.static_inputs.shape[1],
+                ).to(device)
+
+            model = build_model()
+            if config.physics.optimization_mode != "none":
+                teacher_approach = (
+                    config.physics.distillation_teacher
+                    if config.physics.optimization_mode == "distillation"
+                    else config.strategy.approach
+                )
+                teacher_config = replace(
+                    config,
+                    strategy=replace(config.strategy, approach=teacher_approach),
+                    physics=replace(config.physics, optimization_mode="none"),
+                )
+                teacher_traces: dict[str, list[float]] = {}
+                _train(
+                    model, data.train, teacher_config, seed, device, progress_callback,
+                    cancellation_token, teacher_traces, seed_index,
+                    len(config.hyperparameters.seeds), data.feature_names,
+                )
+                if _cancelled(cancellation_token):
+                    break
+                model.eval()
+                response_tensor, recession_tensor = model.reservoir_parameters()
+                response = float(response_tensor.detach().cpu())
+                recession = float(recession_tensor.detach().cpu())
+                train_teacher = validation_teacher = None
+                if config.physics.optimization_mode == "distillation":
+                    train_teacher = _teacher_prediction(
+                        model, data.train, teacher_approach, device,
+                        train_split=data.train, validation_split=data.validation,
+                        ood_quantile=config.hyperparameters.ood_quantile,
+                        ood_shrinkage=config.hyperparameters.ood_shrinkage,
+                    ) * data.discharge_scale.to(device)
+                    validation_teacher = _teacher_prediction(
+                        model, data.validation, teacher_approach, device,
+                        train_split=data.train, validation_split=data.validation,
+                        ood_quantile=config.hyperparameters.ood_quantile,
+                        ood_shrinkage=config.hyperparameters.ood_shrinkage,
+                    ) * data.discharge_scale.to(device)
+                settings = KANPhysicsSettings(
+                    mode=config.physics.optimization_mode,
+                    candidates=config.physics.kan_candidates,
+                    steps=config.physics.kan_steps,
+                    grid=config.physics.kan_grid,
+                    spline_order=config.physics.kan_spline_order,
+                    additive_nodes=config.physics.kan_additive_nodes,
+                    multiplicative_nodes=config.physics.kan_multiplicative_nodes,
+                    sparsity_weight=config.physics.kan_sparsity_weight,
+                    noise_levels=config.physics.robustness_noise_levels,
+                    robustness_accuracy_tolerance=(
+                        config.physics.robustness_accuracy_tolerance
+                    ),
+                    symbolic=config.physics.symbolic,
+                )
+                discovery = discover_kan_physics_correction(
+                    train_physical=data.train.physical_inputs,
+                    validation_physical=data.validation.physical_inputs,
+                    train_observed_flow=(
+                        data.train.targets * data.discharge_scale
+                    ),
+                    validation_observed_flow=(
+                        data.validation.targets * data.discharge_scale
+                    ),
+                    feature_names=data.feature_names,
+                    response=response,
+                    recession=recession,
+                    settings=settings,
+                    seed=seed,
+                    device=device,
+                    train_teacher_flow=train_teacher,
+                    validation_teacher_flow=validation_teacher,
+                    train_basin_ids=data.train.basin_ids,
+                    validation_basin_ids=data.validation.basin_ids,
+                )
+                physics_formulas.append(
+                    f"delta_q = {response:.8g}*max(precipitation-pet, 0) "
+                    f"- {recession:.8g}*previous_discharge + ({discovery.formula})"
+                )
+                physics_candidate_metrics.append(discovery.candidate_metrics)
+                physics_candidate_indices.append(discovery.candidate_index)
+                for phase, values in teacher_traces.items():
+                    traces.setdefault(f"physics_teacher_{phase}", []).extend(values)
+                # Report the frozen equation's direct observation error before a
+                # fresh predictive model is trained with it. These are one-step
+                # predictions because each split supplies observed previous flow.
+                with torch.no_grad():
+                    for split_name, split in (
+                        ("train", data.train),
+                        ("validation", data.validation),
+                        ("test", data.test),
+                    ):
+                        standalone = standalone_kan_prediction(
+                            split.physical_inputs.to(device), data.feature_names,
+                            response, recession, discovery.correction,
+                        )
+                        observed = split.targets.to(device) * data.discharge_scale.to(device)
+                        normalized_mse = (
+                            (standalone - observed) / data.discharge_scale.to(device)
+                        ).square().mean()
+                        traces.setdefault(
+                            f"kan_standalone_{split_name}_observation_mse", []
+                        ).append(float(normalized_mse.cpu()))
+                teacher_raw_response = model.raw_response.detach().clone()
+                teacher_raw_recession = model.raw_recession.detach().clone()
+                model = build_model()
+                model.raw_response.data.copy_(teacher_raw_response)
+                model.raw_recession.data.copy_(teacher_raw_recession)
+                model.raw_response.requires_grad_(False)
+                model.raw_recession.requires_grad_(False)
+                model.set_physics_correction(discovery.correction)
             if config.strategy.approach == "no_routing":
                 parameter_count = sum(
                     item.numel() for item in (
@@ -928,6 +1140,18 @@ def run_regional_experiment(
                     sum(stacking_validation_mses) / len(stacking_validation_mses)
                 ),
                 "stacking_calibration_scope": "pooled_target_validation",
+            })
+        if physics_formulas:
+            routing.update({
+                "physics_optimization_mode": config.physics.optimization_mode,
+                "physics_distillation_teacher": (
+                    config.physics.distillation_teacher
+                    if config.physics.optimization_mode == "distillation" else "none"
+                ),
+                "kan_selected_formulas": physics_formulas,
+                "kan_selected_candidate_indices": physics_candidate_indices,
+                "kan_candidate_metrics": physics_candidate_metrics,
+                "kan_selection_scope": "target_validation",
             })
     else: aggregate, routing = {}, {}
     resolved["fitted_diagnostics"] = dict(routing)
