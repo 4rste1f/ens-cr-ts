@@ -40,6 +40,13 @@ from .regional import (
     run_regional_experiment,
     write_result_artifacts,
 )
+from .result_registry import (
+    DEFAULT_RESULTS_DIRECTORY,
+    SavedRun,
+    discover_runs,
+    filter_runs,
+    save_run,
+)
 
 __all__ = [
     "FourierExpert",
@@ -82,5 +89,10 @@ __all__ = [
     "TrainingStrategyConfig",
     "run_regional_experiment",
     "write_result_artifacts",
+    "DEFAULT_RESULTS_DIRECTORY",
+    "SavedRun",
+    "discover_runs",
+    "filter_runs",
+    "save_run",
     "takens_delay_embedding",
 ]

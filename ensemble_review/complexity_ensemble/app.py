@@ -13,7 +13,11 @@ from .regional import (
     BasinScopeConfig, CAMELSCHCatalog, CancellationToken, DateRange, DateSplitConfig,
     ExtremeEventConfig, HyperparameterConfig, ModelArchitectureConfig,
     PhysicsModelConfig, RegionalExperimentConfig, TrainingStrategyConfig,
-    run_regional_experiment, write_result_artifacts,
+    run_regional_experiment,
+)
+from .result_registry import (
+    DEFAULT_RESULTS_DIRECTORY, FILTER_FIELDS, available_values, discover_runs,
+    filter_runs, leaderboard_rows, parse_bool, save_run,
 )
 
 
@@ -305,7 +309,12 @@ def _config_from_ui_values(data_root: str | Path, target_values, scope_value, va
     )
 
 
-def build_app(data_root: str | Path):
+def build_app(
+    data_root: str | Path,
+    *,
+    save_results: bool = False,
+    results_dir: str | Path = DEFAULT_RESULTS_DIRECTORY,
+):
     """Build a session-scoped Gradio Blocks application."""
     try:
         import gradio as gr
@@ -316,6 +325,9 @@ def build_app(data_root: str | Path):
     choices = [(f"{item.basin_id} — {item.name}", item.basin_id) for item in catalog.records if item.eligible]
     eligible = set(catalog.eligible_ids)
     default_basins = [basin for basin in DEFAULT_BASINS if basin in eligible]
+    results_dir = Path(results_dir)
+    snapshot = discover_runs(results_dir)
+    saved_runs = list(snapshot.runs)
 
     with gr.Blocks(title="Regional Hydrology") as app:
         token_state = gr.State(None)
@@ -423,6 +435,70 @@ def build_app(data_root: str | Path):
             metrics=gr.JSON(label="Metrics"); extremes=gr.Dataframe(label="Extreme-event results")
             with gr.Row(): predictions_file=gr.File(label="Predictions CSV"); metrics_file=gr.File(label="Metrics CSV"); config_file=gr.File(label="Resolved config"); archive_file=gr.File(label="Run archive")
 
+        with gr.Tab("Saved-run leaderboard"):
+            persistence_note = (
+                f"Persistent saving is enabled: `{results_dir}`."
+                if save_results else
+                "Persistent saving is disabled. Launch with `--save-results true` to add runs."
+            )
+            gr.Markdown(persistence_note)
+            registry_status = gr.Markdown(
+                f"Loaded {len(saved_runs)} saved run(s)."
+                + (f" Skipped {len(snapshot.warnings)} invalid entry/entries." if snapshot.warnings else "")
+            )
+            refresh_registry = gr.Button("Refresh saved runs")
+            leaderboard = gr.Dataframe(
+                headers=[
+                    "run_id", "created_at", "approach", "complex", "simple", "epochs",
+                    "KAN", "NSE", "KGE", "RMSE (mm/day)", "physics error",
+                    "parameters", "runtime (s)",
+                ],
+                value=leaderboard_rows(saved_runs), interactive=False,
+                label="Available runs",
+            )
+
+            gr.Markdown("## Compare two saved setups")
+            selector_components = []
+            run_components = []
+            with gr.Row():
+                for side_index, side in enumerate(("A", "B")):
+                    with gr.Column():
+                        gr.Markdown(f"### Setup {side}")
+                        side_components = []
+                        for field, label in FILTER_FIELDS:
+                            choices_for_field = sorted({item.value(field) for item in saved_runs})
+                            component = gr.Dropdown(
+                                choices=["Any", *choices_for_field], value="Any",
+                                label=label,
+                            )
+                            side_components.append(component)
+                        run_choices = [(item.label, item.run_id) for item in saved_runs]
+                        selected_run = gr.Dropdown(
+                            choices=run_choices,
+                            value=(
+                                run_choices[min(side_index, len(run_choices) - 1)][1]
+                                if run_choices else None
+                            ),
+                            label=f"Concrete run {side}",
+                        )
+                        selector_components.append(side_components)
+                        run_components.append(selected_run)
+            compare_metric = gr.Dropdown(
+                choices=[("NSE", "nse"), ("KGE", "kge"), ("RMSE", "rmse_mm_day"),
+                         ("Physics error", "physics_error")],
+                value="nse", label="Per-basin chart metric",
+            )
+            compare = gr.Button("Compare selected runs", variant="primary")
+            comparison_status = gr.Markdown()
+            comparison_table = gr.Dataframe(
+                headers=["field / metric", "setup A", "setup B", "B − A"],
+                interactive=False, label="Configuration and metric comparison",
+            )
+            with gr.Row():
+                aggregate_chart = gr.Plot(label="Aggregate metrics")
+                basin_chart = gr.Plot(label="Per-basin comparison")
+            loss_comparison = gr.Plot(label="Saved loss traces")
+
         def selection_payload(value):
             selected = [str(item) for item in (value or ()) if str(item) in eligible]
             return selected, map_component.payload(
@@ -446,6 +522,144 @@ def build_app(data_root: str | Path):
         cancel.click(
             lambda token: (token.cancel() if token else None, "Cancellation requested.")[1],
             inputs=token_state, outputs=status, queue=False,
+        )
+
+        def _selector_updates(values):
+            selections = {
+                field: value for (field, _), value in zip(FILTER_FIELDS, values)
+            }
+            updates = []
+            for field, _ in FILTER_FIELDS:
+                choices_for_field = available_values(saved_runs, selections, field)
+                current = selections[field]
+                updates.append(gr.Dropdown(
+                    choices=["Any", *choices_for_field],
+                    value=current if current in choices_for_field else "Any",
+                ))
+            matches = filter_runs(saved_runs, selections)
+            choices_for_run = [(item.label, item.run_id) for item in matches]
+            updates.append(gr.Dropdown(
+                choices=choices_for_run,
+                value=choices_for_run[0][1] if choices_for_run else None,
+            ))
+            return updates
+
+        def _make_selector_callback():
+            return lambda *values: _selector_updates(values)
+
+        for side_components, selected_run in zip(selector_components, run_components):
+            for component in side_components:
+                component.change(
+                    _make_selector_callback(),
+                    inputs=side_components,
+                    outputs=[*side_components, selected_run],
+                )
+
+        def refresh_saved_runs(*filter_values):
+            latest = discover_runs(results_dir)
+            saved_runs[:] = latest.runs
+            split = len(FILTER_FIELDS)
+            first = _selector_updates(filter_values[:split])
+            second = _selector_updates(filter_values[split:])
+            message = f"Loaded {len(saved_runs)} saved run(s) from `{results_dir}`."
+            if latest.warnings:
+                message += f" Skipped {len(latest.warnings)} invalid entry/entries."
+            return leaderboard_rows(saved_runs), message, *first, *second
+
+        all_filters = [*selector_components[0], *selector_components[1]]
+        refresh_registry.click(
+            refresh_saved_runs,
+            inputs=all_filters,
+            outputs=[
+                leaderboard, registry_status,
+                *selector_components[0], run_components[0],
+                *selector_components[1], run_components[1],
+            ],
+            queue=False,
+        )
+
+        def compare_saved_runs(run_a_id, run_b_id, metric_name):
+            import plotly.graph_objects as go
+
+            by_id = {item.run_id: item for item in saved_runs}
+            if run_a_id not in by_id or run_b_id not in by_id:
+                raise gr.Error("Select two available saved runs")
+            if run_a_id == run_b_id:
+                raise gr.Error("Select two different saved runs")
+            run_a, run_b = by_id[run_a_id], by_id[run_b_id]
+            table = []
+            for field, label in FILTER_FIELDS:
+                table.append([label, run_a.value(field), run_b.value(field), ""])
+            table.extend([
+                ["Target basins", run_a.value("basins.target_basins"),
+                 run_b.value("basins.target_basins"), ""],
+                ["Created", run_a.created_at, run_b.created_at, ""],
+            ])
+            metric_labels = (
+                ("NSE", "nse"), ("KGE", "kge"), ("RMSE (mm/day)", "rmse_mm_day"),
+                ("Physics error", "physics_error"),
+            )
+            for label, key in metric_labels:
+                value_a = run_a.aggregate_metrics.get(key)
+                value_b = run_b.aggregate_metrics.get(key)
+                delta = (
+                    value_b - value_a
+                    if isinstance(value_a, (int, float)) and isinstance(value_b, (int, float))
+                    else None
+                )
+                table.append([label, value_a, value_b, delta])
+            table.extend([
+                ["Parameters", run_a.parameter_count, run_b.parameter_count,
+                 run_b.parameter_count - run_a.parameter_count],
+                ["Runtime (s)", run_a.runtime_seconds, run_b.runtime_seconds,
+                 run_b.runtime_seconds - run_a.runtime_seconds],
+            ])
+
+            aggregate = go.Figure()
+            aggregate_keys = [item[1] for item in metric_labels]
+            aggregate_labels = [item[0] for item in metric_labels]
+            aggregate.add_bar(
+                name="Setup A", x=aggregate_labels,
+                y=[run_a.aggregate_metrics.get(key) for key in aggregate_keys],
+            )
+            aggregate.add_bar(
+                name="Setup B", x=aggregate_labels,
+                y=[run_b.aggregate_metrics.get(key) for key in aggregate_keys],
+            )
+            aggregate.update_layout(barmode="group", title="Aggregate test metrics")
+
+            basin = go.Figure()
+            basin_ids = sorted(set(run_a.per_basin_metrics) | set(run_b.per_basin_metrics))
+            basin.add_bar(
+                name="Setup A", x=basin_ids,
+                y=[run_a.per_basin_metrics.get(item, {}).get(metric_name) for item in basin_ids],
+            )
+            basin.add_bar(
+                name="Setup B", x=basin_ids,
+                y=[run_b.per_basin_metrics.get(item, {}).get(metric_name) for item in basin_ids],
+            )
+            basin.update_layout(
+                barmode="group", title=f"Per-basin {metric_name}", xaxis_title="Basin",
+            )
+
+            losses = go.Figure()
+            for side, selected, dash in (("A", run_a, "solid"), ("B", run_b, "dash")):
+                for phase, values in selected.loss_traces.items():
+                    losses.add_scatter(
+                        y=values, mode="lines+markers", name=f"{side}: {phase}",
+                        line={"dash": dash},
+                    )
+            losses.update_layout(title="Training and standalone KAN traces", xaxis_title="Step")
+            return (
+                f"Comparing `{run_a.run_id}` with `{run_b.run_id}`.",
+                table, aggregate, basin, losses,
+            )
+
+        compare.click(
+            compare_saved_runs,
+            inputs=[run_components[0], run_components[1], compare_metric],
+            outputs=[comparison_status, comparison_table, aggregate_chart,
+                     basin_chart, loss_comparison],
         )
 
         def result_views(result, basin):
@@ -492,13 +706,42 @@ def build_app(data_root: str | Path):
                 )
             except (ValueError, FileNotFoundError, RuntimeError) as error:
                 raise gr.Error(str(error)) from error
-            paths=write_result_artifacts(result)
-            message="Cancelled; showing completed partial results." if result.cancelled else f"Completed in {result.runtime_seconds:.1f}s"
+            paths = None
+            if save_results and not result.cancelled:
+                saved = save_run(result, results_dir)
+                saved_runs.insert(0, saved)
+                paths = {
+                    "predictions": saved.path / "predictions.csv",
+                    "metrics": saved.path / "metrics.csv",
+                    "config": saved.path / "config.json",
+                    "archive": saved.path / "regional_experiment.zip",
+                }
+            if result.cancelled:
+                message = "Cancelled; showing completed partial results. The partial run was not saved."
+            elif paths is not None:
+                message = (
+                    f"Completed in {result.runtime_seconds:.1f}s and saved to the leaderboard. "
+                    "Use ‘Refresh saved runs’ to add it to the comparison selectors."
+                )
+            else:
+                message = (
+                    f"Completed in {result.runtime_seconds:.1f}s. This run was not persisted "
+                    "because result saving is disabled."
+                )
             basin,historical,future,hydro,points,route,losses=result_views(
                 result, (target_values or [None])[0]
             )
             metric_value={"aggregate":result.aggregate_metrics,"per_basin":result.per_basin_metrics,"routing":result.routing_diagnostics,"parameters":result.parameter_count,"runtime_seconds":result.runtime_seconds,"failures":result.failures}
-            return token,result,message,historical,future,basin,hydro,points,route,losses,metric_value,result.extreme_events,paths["predictions"],paths["metrics"],paths["config"],paths["archive"]
+            file_values = (
+                [str(paths[key]) for key in ("predictions", "metrics", "config", "archive")]
+                if paths is not None else [None, None, None, None]
+            )
+            registry_message = f"Loaded {len(saved_runs)} saved run(s)."
+            return (
+                token, result, message, historical, future, basin, hydro, points, route,
+                losses, metric_value, result.extreme_events, *file_values,
+                leaderboard_rows(saved_runs), registry_message,
+            )
 
         def refresh_result(basin, result):
             if result is None:
@@ -517,7 +760,8 @@ def build_app(data_root: str | Path):
         prepare.then(execute, inputs=[targets, scope, token_state, *inputs[2:]],
             outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,
                      hydrograph,scatter,routing_plot,loss_plot,metrics,extremes,
-                     predictions_file,metrics_file,config_file,archive_file],
+                     predictions_file,metrics_file,config_file,archive_file,
+                     leaderboard,registry_status],
             concurrency_id="regional-training", concurrency_limit=1)
         result_outputs=[active_basin,historical_map,future_map,hydrograph,scatter,routing_plot,loss_plot]
         active_basin.change(
@@ -536,10 +780,20 @@ def main() -> None:
     parser=argparse.ArgumentParser(description="Launch the regional CAMELS-CH Gradio application")
     parser.add_argument("--data-root",type=Path,default=os.environ.get("CAMELS_CH_ROOT"))
     parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=7860)
+    parser.add_argument(
+        "--save-results", type=parse_bool, default=False, metavar="true|false",
+        help="Persist completed runs in the shared leaderboard registry (default: false)",
+    )
+    parser.add_argument(
+        "--results-dir", type=Path, default=DEFAULT_RESULTS_DIRECTORY,
+        help="Shared run-registry directory",
+    )
     args=parser.parse_args()
     if args.data_root is None: parser.error("--data-root or CAMELS_CH_ROOT is required")
     CAMELSCHCatalog.validate_layout(args.data_root)
-    build_app(args.data_root).launch(server_name=args.host,server_port=args.port,share=True)
+    build_app(
+        args.data_root, save_results=args.save_results, results_dir=args.results_dir,
+    ).launch(server_name=args.host,server_port=args.port,share=True)
 
 
 if __name__ == "__main__": main()

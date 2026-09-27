@@ -11,6 +11,7 @@ dependencies = ["matplotlib", "numpy", "torch", "gradio>=6,<7", "plotly", "panda
 
 [project.scripts]
 complexity-ensemble-app = "complexity_ensemble.app:main"
+complexity-ensemble-run = "complexity_ensemble.regional_cli:main"
 
 [project.optional-dependencies]
 tda = ["ripser>=0.6"]
