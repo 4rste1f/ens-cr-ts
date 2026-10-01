@@ -13,6 +13,9 @@ dependencies = ["matplotlib", "numpy", "torch", "gradio>=6,<7", "plotly", "panda
 complexity-ensemble-app = "complexity_ensemble.app:main"
 complexity-ensemble-run = "complexity_ensemble.regional_cli:main"
 
+[tool.setuptools.package-data]
+complexity_ensemble = ["design/*.css"]
+
 [project.optional-dependencies]
 tda = ["ripser>=0.6"]
 kan = ["pykan>=0.2.8"]

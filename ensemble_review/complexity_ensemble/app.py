@@ -13,6 +13,8 @@ from .camels_ch_chem import (
     CAMELS_CH_CHEM_DYNAMIC_FEATURES, DEFAULT_CAMELS_CH_CHEM_FEATURES,
     CAMELSCHChemPressures,
 )
+from .design import launch_style
+from .design.dataset_help import dataset_info
 from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .regional import (
     BasinScopeConfig, CAMELSCHCatalog, CancellationToken, DateRange, DateSplitConfig,
@@ -63,7 +65,7 @@ _BASIN_MAP_CSS = """
 }
 .basin-map-legend span { display: inline-flex; align-items: center; gap: 5px; }
 .basin-map-legend i { width: 11px; height: 11px; border: 1px solid #475569; border-radius: 2px; }
-.basin-map-legend .target { background: #2563eb; }
+.basin-map-legend .target { background: #059669; }
 .basin-map-legend .training { background: #16a34a; }
 .basin-map-legend .held-out { background: #f59e0b; }
 .basin-map-legend .unused { background: #cbd5e1; }
@@ -101,11 +103,11 @@ const styleFeature = (feature) => {
     const selected = new Set((current.selected || []).map(String));
     const training = new Set((current.training || []).map(String));
     let fillColor = '#cbd5e1';
-    if (current.future) fillColor = selected.has(id) ? '#2563eb' : '#cbd5e1';
+    if (current.future) fillColor = selected.has(id) ? '#059669' : '#cbd5e1';
     else if (training.has(id)) fillColor = '#16a34a';
     else if (selected.has(id)) fillColor = '#f59e0b';
     return {
-        pane: 'basins', color: id === String(current.active ?? '') ? '#0f172a' : '#475569',
+        pane: 'basins', color: id === String(current.active ?? '') ? '#065f46' : '#475569',
         weight: id === String(current.active ?? '') ? 4 : 1.2,
         fillColor, fillOpacity: selected.has(id) || training.has(id) ? 0.72 : 0.42,
     };
@@ -250,11 +252,12 @@ class BasinMapComponent:
                 points = [((x-minx)*scale+10, 500-(y-miny)*scale) for x, y in exterior.coords]
                 commands.append("M " + " L ".join(f"{x:.2f},{y:.2f}" for x,y in points) + " Z")
             if future:
-                color = "#2563eb" if record.basin_id in selected else "#d1d5db"
+                color = "#059669" if record.basin_id in selected else "#d1d5db"
             else:
                 color = "#16a34a" if record.basin_id in training else ("#f59e0b" if record.basin_id in selected else "#d1d5db")
             width = 3 if record.basin_id == active else 1
-            paths.append(f'<path d="{" ".join(commands)}" fill="{color}" stroke="#334155" stroke-width="{width}" data-basin="{html.escape(record.basin_id)}"><title>{html.escape(record.basin_id)} — {html.escape(record.name)}</title></path>')
+            stroke = "#065f46" if record.basin_id == active else "#334155"
+            paths.append(f'<path d="{" ".join(commands)}" fill="{color}" stroke="{stroke}" stroke-width="{width}" data-basin="{html.escape(record.basin_id)}"><title>{html.escape(record.basin_id)} — {html.escape(record.name)}</title></path>')
         return '<svg viewBox="0 0 800 520" role="img" aria-label="CAMELS-CH basin map" style="width:100%;max-height:520px">' + "".join(paths) + '</svg>'
 
 
@@ -360,10 +363,10 @@ def build_app(
     snapshot = discover_runs(results_dir)
     saved_runs = list(snapshot.runs)
 
-    with gr.Blocks(title="Regional Hydrology") as app:
+    with gr.Blocks(title="Regional hydrology and land assessment platform with heterogeneous ensembles") as app:
         token_state = gr.State(None)
         experiment_state = gr.State(None)
-        gr.Markdown("# Regional hydrology experiment")
+        gr.Markdown("# Regional hydrology and land assessment platform with heterogeneous ensembles")
         with gr.Tab("Target basins"):
             basin_map = map_component.gradio_component(
                 gr, selected=default_basins, future=True, interaction="toggle",
@@ -420,11 +423,15 @@ def build_app(
                 "CAMELS-CH daily hydrology is the required base dataset. Optional datasets "
                 "are read from their existing locations and are not copied into the project."
             )
-            gr.Checkbox(True, label="CAMELS-CH daily hydrology (required)", interactive=False)
-            use_estreams = gr.Checkbox(
-                value=estreams_root is not None,
-                label="Include EStreams vegetation and snow",
-            )
+            with gr.Row():
+                gr.Checkbox(True, label="CAMELS-CH daily hydrology (required)", interactive=False)
+                dataset_info(gr, "camels")
+            with gr.Row():
+                use_estreams = gr.Checkbox(
+                    value=estreams_root is not None,
+                    label="Include EStreams vegetation and snow",
+                )
+                dataset_info(gr, "estreams")
             estreams_path = gr.Textbox(
                 value=str(estreams_root or ""),
                 label="EStreams extracted dataset directory",
@@ -442,10 +449,12 @@ def build_app(
             validate_estreams = gr.Button("Validate EStreams path")
             estreams_status = gr.Markdown()
             gr.Markdown("### CAMELS-CH-Chem catchment pressures")
-            use_camels_chem = gr.Checkbox(
-                value=camels_chem_root is not None,
-                label="Include CAMELS-CH-Chem land-use and deposition predictors",
-            )
+            with gr.Row():
+                use_camels_chem = gr.Checkbox(
+                    value=camels_chem_root is not None,
+                    label="Include CAMELS-CH-Chem land-use and deposition predictors",
+                )
+                dataset_info(gr, "camels-chem")
             camels_chem_path = gr.Textbox(
                 value=str(camels_chem_root or ""),
                 label="CAMELS-CH-Chem extracted dataset directory",
@@ -944,7 +953,7 @@ def main() -> None:
         args.data_root, estreams_root=args.estreams_root,
         camels_chem_root=args.camels_chem_root,
         save_results=args.save_results, results_dir=args.results_dir,
-    ).launch(server_name=args.host,server_port=args.port,share=True)
+    ).launch(server_name=args.host,server_port=args.port,share=True,**launch_style())
 
 
 if __name__ == "__main__": main()
