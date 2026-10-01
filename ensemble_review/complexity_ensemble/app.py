@@ -6,6 +6,7 @@ import argparse
 import html
 import os
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -17,6 +18,7 @@ from .design import launch_style
 from .design.config_help import config_info
 from .design.dataset_help import dataset_info
 from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
+from .paved_scenario import PavedSiteConfig, run_paved_site_scenario
 from .regional import (
     BasinScopeConfig, CAMELSCHCatalog, CancellationToken, DateRange, DateSplitConfig,
     ExtremeEventConfig, ForecastConfig, HyperparameterConfig, ModelArchitectureConfig,
@@ -596,6 +598,50 @@ def build_app(
             gr.Markdown("Rolling forecasts replace future observed discharge with the model's own predictions. "
                         "They use historical weather observations for future days, so they are perfect-weather "
                         "hindcasts rather than operational forecasts.")
+        with gr.Tab("Impact scenario"):
+            gr.Markdown(
+                "## Paved-area runoff and retention\n"
+                "1. Set the parameters below and click **Run experiment with scenario**. "
+                "The comparison will appear here when training finishes.\n"
+                "2. To try other values without retraining, change them here and click "
+                "**Compare with current run**."
+            )
+            scenario_enabled = gr.Checkbox(
+                False, label="Also apply scenario when using Run experiment in Results",
+            )
+            with gr.Row():
+                site_percent = gr.Number(0.1, label="Site area (% of upstream basin)")
+                original_paved = gr.Number(10, label="Original paved area (%)")
+                proposed_paved = gr.Number(80, label="Proposed paved area (%)")
+                connected_percent = gr.Number(100, label="Runoff reaching gauge (%)")
+            with gr.Row():
+                pervious_coefficient = gr.Number(0.25, label="Pervious runoff coefficient (0–1)")
+                paved_coefficient = gr.Number(0.9, label="Paved runoff coefficient (0–1)")
+                storage_mm = gr.Number(20, label="Retention capacity (mm over site)")
+                release_mm_day = gr.Number(2, label="Maximum release (mm/day over site)")
+            scenario_start = gr.Textbox(
+                "", label="Start date (YYYY-MM-DD; blank = first forecast day)",
+            )
+            gr.Markdown(
+                "Site area is a fraction of the basin upstream of the gauge. Runoff "
+                "coefficients are the assumed fraction of daily rainfall becoming runoff. "
+                "Storage capacity and maximum release are depths over the whole site; "
+                "set capacity to zero for paving without retention. The site is assumed "
+                "to drain to the selected gauge. This daily sensitivity calculation uses "
+                "historical CAMELS-CH rainfall and starts with empty storage. Only the "
+                "change from the original site's runoff is added to baseline discharge. "
+                "Event thresholds stay fixed to training observations. Adjusted discharge "
+                "is not fed back into later model predictions."
+            )
+            scenario_basin = gr.Dropdown(
+                choices=choices, value=default_basins[0] if default_basins else None,
+                label="Basin to compare (must be a prediction target)",
+            )
+            run_scenario_experiment = gr.Button("Run experiment with scenario", variant="primary")
+            run_scenario = gr.Button("Compare with current run")
+            scenario_summary = gr.JSON(label="Scenario summary")
+            scenario_plot = gr.Plot(label="Baseline and scenario discharge")
+            scenario_events = gr.Dataframe(label="Before and after event counts")
         with gr.Tab("Results"):
             run=gr.Button("Run experiment",variant="primary"); cancel=gr.Button("Cancel")
             status=gr.Markdown()
@@ -702,6 +748,8 @@ predictors; discharge remains the prediction target.
 Run results include basin maps, observed-versus-predicted discharge plots,
 expert usage, loss traces, discharge metrics, and optional hydrological event
 scores. One-day forecasts can be compared with rolling multi-day hindcasts.
+The Results tab also offers a user-defined daily paved-site and retention
+scenario, with baseline and scenario discharge and fixed-threshold event counts.
 You can export predictions,
 metrics, and the resolved configuration. When persistent saving is enabled,
 the leaderboard lets you revisit and compare saved runs.
@@ -938,12 +986,75 @@ the leaderboard lets you revisit and compare saved runs.
                 hydro, points, route, losses,
             )
 
+        def paved_site_setup(site, old_paved, new_paved, connected, pervious,
+                             paved, capacity, release, start_text):
+            start = date.fromisoformat(str(start_text).strip()) if str(start_text).strip() else None
+            setup = PavedSiteConfig(
+                site_fraction=float(site) / 100,
+                original_paved_fraction=float(old_paved) / 100,
+                proposed_paved_fraction=float(new_paved) / 100,
+                pervious_runoff_coefficient=float(pervious),
+                paved_runoff_coefficient=float(paved),
+                connected_fraction=float(connected) / 100,
+                storage_capacity_mm=float(capacity),
+                release_mm_day=float(release), start_date=start,
+            )
+            setup.validate()
+            return setup
+
+        def compare_paved_site(result, basin, *site_values):
+            import pandas as pd
+            import plotly.graph_objects as go
+
+            if result is None or not result.predictions:
+                raise gr.Error("Run an experiment before comparing a site scenario")
+            targets_in_run = result.resolved_config["basins"]["target_basins"]
+            if basin is None or str(basin) not in targets_in_run:
+                raise gr.Error("Select a prediction target from the current run")
+            try:
+                setup = paved_site_setup(*site_values)
+                resolved = result.resolved_config
+                train = DateRange(**resolved["dates"]["train"])
+                event_setup = ExtremeEventConfig(**resolved["extremes"])
+                first = min(train.resolved().start, setup.start_date) if setup.start_date else train.resolved().start
+                last = max(row.target_date for row in result.predictions if row.basin_id == basin)
+                series = catalog.load_series(str(basin), first, last)
+                comparison = run_paved_site_scenario(
+                    result.predictions, series, train, event_setup, setup,
+                )
+            except (TypeError, ValueError, FileNotFoundError) as error:
+                raise gr.Error(str(error)) from error
+            frame = pd.DataFrame(comparison.rows)
+            daily = frame.groupby("date", as_index=False)[
+                ["baseline_mm_day", "scenario_mm_day"]
+            ].mean()
+            figure = go.Figure()
+            figure.add_scatter(x=daily["date"], y=daily["baseline_mm_day"],
+                               name="Baseline", mode="lines")
+            figure.add_scatter(x=daily["date"], y=daily["scenario_mm_day"],
+                               name="Proposed site", mode="lines")
+            figure.update_layout(yaxis_title="Discharge (mm/day)",
+                                 title=f"Basin {basin}: mean across seeds")
+            return comparison.summary, figure, pd.DataFrame(comparison.events)
+
+        run_scenario.click(
+            compare_paved_site,
+            inputs=[experiment_state, scenario_basin, site_percent, original_paved,
+                    proposed_paved, connected_percent, pervious_coefficient,
+                    paved_coefficient, storage_mm, release_mm_day, scenario_start],
+            outputs=[scenario_summary, scenario_plot, scenario_events],
+        )
+
         def execute(target_values, scope_value, token, *values, progress=gr.Progress()):
             import pandas as pd
 
+            scenario_values = values[-9:]
+            run_with_scenario = bool(values[-10])
             try:
+                if run_with_scenario:
+                    paved_site_setup(*scenario_values)
                 config = _config_from_ui_values(
-                    data_root, target_values, scope_value, values,
+                    data_root, target_values, scope_value, values[:-10],
                     estreams_root=estreams_root,
                     camels_chem_root=camels_chem_root,
                 )
@@ -977,16 +1088,22 @@ the leaderboard lets you revisit and compare saved runs.
             basin,historical,future,hydro,points,route,losses=result_views(
                 result, (target_values or [None])[0]
             )
+            scenario_result = (None, None, None)
+            if run_with_scenario and result.predictions and not result.cancelled:
+                scenario_result = compare_paved_site(result, basin, *scenario_values)
+                message += " Paved-site comparison is ready in the Impact scenario tab."
             metric_value={"aggregate":result.aggregate_metrics,"per_basin":result.per_basin_metrics,"by_lead_day":result.forecast_metrics,"routing":result.routing_diagnostics,"parameters":result.parameter_count,"runtime_seconds":result.runtime_seconds,"failures":result.failures}
             file_values = (
                 [str(paths[key]) for key in ("predictions", "metrics", "config", "archive")]
                 if paths is not None else [None, None, None, None]
             )
             registry_message = f"Loaded {len(saved_runs)} saved run(s)."
+            scenario_choices = [item for item in choices if item[1] in result.resolved_config["basins"]["target_basins"]]
             return (
                 token, result, message, historical, future, basin, hydro, points, route,
                 losses, metric_value, pd.DataFrame(result.extreme_events), *file_values,
                 leaderboard_rows(saved_runs), registry_message,
+                gr.Dropdown(choices=scenario_choices, value=basin), *scenario_result,
             )
 
         def refresh_result(basin, result):
@@ -1003,12 +1120,25 @@ the leaderboard lets you revisit and compare saved runs.
 
         inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage,physics_optimization,physics_teacher,kan_candidates,kan_steps,kan_grid,kan_order,kan_additive,kan_multiplicative,kan_sparsity,kan_noise_levels,kan_accuracy_tolerance,kan_symbolic,use_estreams,estreams_path,estreams_features,use_camels_chem,camels_chem_path,camels_chem_features,forecast_mode,horizon_days,event_types,high_quantile,low_quantile,rise_quantile,minimum_days,pulse_gap_days,minimum_basins,fall_quantile]
         prepare = run.click(lambda: CancellationToken(), outputs=token_state, queue=False)
-        prepare.then(execute, inputs=[targets, scope, token_state, *inputs[2:]],
-            outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,
-                     hydrograph,scatter,routing_plot,loss_plot,metrics,extremes,
-                     predictions_file,metrics_file,config_file,archive_file,
-                     leaderboard,registry_status],
-            concurrency_id="regional-training", concurrency_limit=1)
+        scenario_prepare = run_scenario_experiment.click(
+            lambda: (CancellationToken(), True),
+            outputs=[token_state, scenario_enabled], queue=False,
+        )
+        scenario_inputs = [site_percent, original_paved, proposed_paved,
+                           connected_percent, pervious_coefficient, paved_coefficient,
+                           storage_mm, release_mm_day, scenario_start]
+        for launch_event in (prepare, scenario_prepare):
+            launch_event.then(
+                execute,
+                inputs=[targets, scope, token_state, *inputs[2:],
+                        scenario_enabled, *scenario_inputs],
+                outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,
+                         hydrograph,scatter,routing_plot,loss_plot,metrics,extremes,
+                         predictions_file,metrics_file,config_file,archive_file,
+                         leaderboard,registry_status,scenario_basin,scenario_summary,
+                         scenario_plot,scenario_events],
+                concurrency_id="regional-training", concurrency_limit=1,
+            )
         result_outputs=[active_basin,historical_map,future_map,hydrograph,scatter,routing_plot,loss_plot]
         active_basin.change(
             refresh_result_views, inputs=[active_basin,experiment_state], outputs=result_outputs[1:]

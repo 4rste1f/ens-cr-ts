@@ -59,3 +59,40 @@ weather information. It reuses the trained one-day model; the model is not
 separately trained for each lead time. To make an operational forecast, supply
 weather forecasts available at each issue date and evaluate the whole
 weather-to-discharge chain by lead time and event.
+
+## Paved-site runoff and retention scenario
+
+Open **Impact scenario**, set the controls, and click **Run experiment with
+scenario**. The comparison appears there when training finishes. Alternatively,
+check **Also apply scenario when using Run experiment in Results** and run from
+Results. To compare different
+parameters against the same completed run, choose its target basin in Impact
+scenario and click **Compare with current run**; this does not retrain the model.
+The controls define a site's fraction of the upstream
+basin, its original and proposed paved fractions, daily runoff coefficients
+for paved and pervious surfaces, the fraction draining to the gauge, and a
+retention capacity and maximum daily release. Capacity and release are
+millimetres over the full site area. The default 20 mm capacity and 2 mm/day
+release are illustrative assumptions, not calibrated design values.
+
+For each day, the scenario converts historical basin-average precipitation
+to site runoff using the area-weighted coefficients. Proposed runoff enters a
+simple bucket: water above capacity overflows on the same day, and stored
+water releases at up to the configured daily limit. The original site is
+assumed to have no retention. The difference between proposed output and
+original runoff is multiplied by connected site area as a fraction of basin
+area, then added to each baseline discharge prediction. Negative results are
+clipped to zero and counted in the scenario summary. Storage starts empty at
+the chosen start date and resets after gaps in the rainfall series.
+
+The plot averages forecast seeds; the event table reports each seed. Event
+thresholds are fixed from training-period observed discharge. The daily
+high-flow row uses Q95 by default, or the configured statistical threshold
+when that task is selected. Other rows follow the configured hydrological
+event definitions, or their defaults for a discharge-only experiment. The
+comparison reports changes in predicted events, not observed impacts or a
+new measure of forecast skill. The scenario is an interactive, unsaved
+sensitivity analysis; it does not retrain the model or alter leaderboard
+metrics. Historical daily rainfall is supplied even for rolling hindcasts,
+and adjusted discharge is not fed back into later model predictions. This
+calculation cannot resolve short storm peaks, drainage hydraulics, or flooding.
