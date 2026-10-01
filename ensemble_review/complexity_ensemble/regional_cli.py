@@ -8,6 +8,8 @@ from dataclasses import fields
 from pathlib import Path
 from typing import Mapping, TypeVar
 
+from .camels_ch_chem import DEFAULT_CAMELS_CH_CHEM_FEATURES
+from .estreams import ESTREAMS_DYNAMIC_FEATURES
 from .regional import (
     BasinScopeConfig, DateRange, DateSplitConfig, ExtremeEventConfig,
     HyperparameterConfig, ModelArchitectureConfig, PhysicsModelConfig,
@@ -31,7 +33,9 @@ def _dataclass_values(cls: type[T], value: Mapping[str, object]) -> dict[str, ob
 
 
 def config_from_mapping(
-    value: Mapping[str, object], *, data_root: str | Path | None = None
+    value: Mapping[str, object], *, data_root: str | Path | None = None,
+    estreams_root: str | Path | None = None,
+    camels_chem_root: str | Path | None = None,
 ) -> RegionalExperimentConfig:
     """Build the typed service configuration from saved/resolved JSON."""
     try:
@@ -59,6 +63,14 @@ def config_from_mapping(
         raise ValueError("data_root is required in the config or as --data-root")
     targets = basin_value.get("target_basins", ())
     eligible = basin_value.get("eligible_basins")
+    resolved_estreams = (
+        estreams_root if estreams_root is not None else value.get("estreams_root")
+    )
+    estreams_features = value.get("estreams_features", ESTREAMS_DYNAMIC_FEATURES)
+    resolved_chem = (
+        camels_chem_root if camels_chem_root is not None else value.get("camels_chem_root")
+    )
+    chem_features = value.get("camels_chem_features", DEFAULT_CAMELS_CH_CHEM_FEATURES)
     return RegionalExperimentConfig(
         resolved_root,
         BasinScopeConfig(
@@ -72,6 +84,18 @@ def config_from_mapping(
         HyperparameterConfig(**_dataclass_values(HyperparameterConfig, section("hyperparameters"))),
         PhysicsModelConfig(**_dataclass_values(PhysicsModelConfig, section("physics"))),
         ExtremeEventConfig(**_dataclass_values(ExtremeEventConfig, section("extremes"))),
+        estreams_root=resolved_estreams if resolved_estreams not in (None, "") else None,
+        estreams_features=(
+            tuple(map(str, estreams_features))
+            if isinstance(estreams_features, (list, tuple))
+            else ESTREAMS_DYNAMIC_FEATURES
+        ),
+        camels_chem_root=resolved_chem if resolved_chem not in (None, "") else None,
+        camels_chem_features=(
+            tuple(map(str, chem_features))
+            if isinstance(chem_features, (list, tuple))
+            else DEFAULT_CAMELS_CH_CHEM_FEATURES
+        ),
     )
 
 
@@ -79,6 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Regional experiment JSON")
     parser.add_argument("--data-root", type=Path, help="Override data_root from the JSON file")
+    parser.add_argument(
+        "--estreams-root", type=Path,
+        help="Read EStreams vegetation and snow from this extracted dataset directory",
+    )
+    parser.add_argument(
+        "--camels-chem-root", type=Path,
+        help="Read CAMELS-CH-Chem pressures from this extracted dataset directory",
+    )
     parser.add_argument(
         "--save-results", type=parse_bool, default=False, metavar="true|false",
         help="Persist the completed run in the shared leaderboard registry (default: false)",
@@ -97,7 +129,10 @@ def main() -> None:
         raw = json.loads(args.config.read_text(encoding="utf-8"))
         if not isinstance(raw, Mapping):
             raise ValueError("the top-level configuration must be a JSON object")
-        config = config_from_mapping(raw, data_root=args.data_root)
+        config = config_from_mapping(
+            raw, data_root=args.data_root, estreams_root=args.estreams_root,
+            camels_chem_root=args.camels_chem_root,
+        )
         result = run_regional_experiment(
             config,
             lambda fraction, message: print(f"[{fraction:6.1%}] {message}", flush=True),

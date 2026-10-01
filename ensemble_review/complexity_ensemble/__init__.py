@@ -1,6 +1,10 @@
 """Complexity-routed hydrology ensemble building blocks."""
 
 from .experts import FourierExpert, MLPExpert, RBFExpert, build_expert
+from .camels_ch_chem import (
+    CAMELS_CH_CHEM_DYNAMIC_FEATURES, DEFAULT_CAMELS_CH_CHEM_FEATURES,
+    CAMELSCHChemPressures,
+)
 from .hydrology import (
     HydrologyPINNMambaExpert,
     LearnedHydrologyMorsePotential,
@@ -8,6 +12,7 @@ from .hydrology import (
     SingleComplexHydrologyModel,
 )
 from .hydrology_data import load_camels_ch, load_ukraine_csv, make_hydrology_data
+from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .hydrology_extreme_comparison import (
     ENSEMBLE_APPROACHES,
     ExtremeComparisonConfig,
@@ -50,9 +55,14 @@ from .result_registry import (
 
 __all__ = [
     "FourierExpert",
+    "CAMELS_CH_CHEM_DYNAMIC_FEATURES",
+    "DEFAULT_CAMELS_CH_CHEM_FEATURES",
+    "CAMELSCHChemPressures",
     "ENSEMBLE_APPROACHES",
     "ExtremeComparisonConfig",
     "ExtremeEnsembleRecord",
+    "ESTREAMS_DYNAMIC_FEATURES",
+    "EStreamsVegetationSnow",
     "HydrologyPINNMambaExpert",
     "HydrologyComplexityEstimator",
     "LearnedHydrologyMorsePotential",

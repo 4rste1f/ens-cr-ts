@@ -5,7 +5,9 @@ import pytest
 import torch
 
 from complexity_ensemble.app import BasinMapComponent, DEFAULT_BASINS, _config_from_ui_values
+from complexity_ensemble.camels_ch_chem import CAMELSCHChemPressures
 from complexity_ensemble.hydrology_data import HydrologySeries
+from complexity_ensemble.estreams import EStreamsVegetationSnow
 from complexity_ensemble.regional import (
     BasinCatalogRecord, BasinScopeConfig, CAMELSCHCatalog, CancellationToken,
     DateRange, DateSplitConfig, ExtremeEventConfig, HyperparameterConfig,
@@ -29,6 +31,201 @@ def _dates() -> DateSplitConfig:
     return DateSplitConfig(DateRange("2001-01-08", "2001-02-02"),
                            DateRange("2001-02-03", "2001-02-12"),
                            DateRange("2001-02-13", "2001-03-01"))
+
+
+def _write_estreams(root, gauge_ids=("a", "target")):
+    attributes = root / "attributes" / "temporal_attributes"
+    gauges = root / "streamflow_gauges"
+    attributes.mkdir(parents=True)
+    gauges.mkdir()
+    with (gauges / "estreams_gauging_stations.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as target:
+        writer = csv.DictWriter(
+            target, fieldnames=["basin_id", "gauge_id", "gauge_provider"]
+        )
+        writer.writeheader()
+        for index, gauge_id in enumerate(gauge_ids):
+            writer.writerow({
+                "basin_id": f"CH{index:06d}", "gauge_id": gauge_id,
+                "gauge_provider": "CH_CAMELS",
+            })
+    filenames = {
+        "estreams_LAI_monhtly.csv": (1.0, 2.0),
+        "estreams_NDVI_monhtly.csv": (0.2, 0.4),
+        "estreams_snowcover_monhtly.csv": (25.0, 10.0),
+    }
+    fields = ["date", *(f"CH{index:06d}" for index in range(len(gauge_ids)))]
+    for filename, monthly_values in filenames.items():
+        with (attributes / filename).open("w", newline="", encoding="utf-8") as target:
+            writer = csv.DictWriter(target, fieldnames=fields)
+            writer.writeheader()
+            writer.writerow({"date": "2001-01-31", **{
+                field: monthly_values[0] + index
+                for index, field in enumerate(fields[1:])
+            }})
+            writer.writerow({"date": "2001-02-28", **{
+                field: monthly_values[1] + index
+                for index, field in enumerate(fields[1:])
+            }})
+
+
+def _write_camels_chem(root, gauge_ids=("a", "target")):
+    groups = {
+        "agricultural_data": ("swisscrops", ["total_arable"], [100.0, 110.0]),
+        "livestock_data": ("livestock", ["gve_ha"], [0.5, 0.6]),
+        "atmospheric_deposition": ("atmdepo", ["dntotal"], [20.0, 18.0]),
+    }
+    metadata = root / "gauges_metadata"
+    metadata.mkdir(parents=True)
+    with (metadata / "camels_ch_chem_gauges_metadata.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as target:
+        writer = csv.DictWriter(target, fieldnames=["gauge_id"])
+        writer.writeheader()
+        for gauge_id in gauge_ids:
+            writer.writerow({"gauge_id": gauge_id})
+    aggregated = root / "catchment_aggregated_data"
+    for directory, (prefix, columns, annual_values) in groups.items():
+        path = aggregated / directory
+        path.mkdir(parents=True)
+        for basin_index, gauge_id in enumerate(gauge_ids):
+            with (path / f"camels_ch_chem_{prefix}_{gauge_id}.csv").open(
+                "w", newline="", encoding="utf-8"
+            ) as target:
+                writer = csv.DictWriter(target, fieldnames=["date", *columns])
+                writer.writeheader()
+                writer.writerow({
+                    "date": "2000",
+                    **{column: value + basin_index for column, value in zip(columns, annual_values)},
+                })
+                writer.writerow({
+                    "date": "2001",
+                    **{column: value + 10 + basin_index for column, value in zip(columns, annual_values)},
+                })
+    isotopes = aggregated / "rain_water_isotopes"
+    isotopes.mkdir(parents=True)
+    for basin_index, gauge_id in enumerate(gauge_ids):
+        with (isotopes / f"camels_ch_chem_rainisotopes_{gauge_id}.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as target:
+            writer = csv.DictWriter(target, fieldnames=["date", "delta_18o"])
+            writer.writeheader()
+            writer.writerow({"date": "2001-01-15", "delta_18o": -12.0 + basin_index})
+            writer.writerow({"date": "2001-02-15", "delta_18o": -10.0 + basin_index})
+
+
+def test_estreams_monthly_features_are_causally_aligned(tmp_path):
+    _write_estreams(tmp_path)
+    source = {"a": _series("a"), "missing": _series("missing")}
+
+    augmented = EStreamsVegetationSnow(tmp_path).augment(source)
+
+    assert augmented["a"].forcing_names[-6:] == (
+        "estreams_lai", "estreams_lai_available",
+        "estreams_ndvi", "estreams_ndvi_available",
+        "estreams_snow_cover_fraction", "estreams_snow_cover_fraction_available",
+    )
+    jan_30 = augmented["a"].dates.index(date(2001, 1, 30))
+    jan_31 = augmented["a"].dates.index(date(2001, 1, 31))
+    feb_27 = augmented["a"].dates.index(date(2001, 2, 27))
+    feb_28 = augmented["a"].dates.index(date(2001, 2, 28))
+    external = augmented["a"].forcings[:, -6:]
+    assert external[jan_30].tolist() == [0.0] * 6
+    assert external[jan_31].tolist() == pytest.approx([1.0, 1.0, 0.2, 1.0, 0.25, 1.0])
+    assert external[feb_27].tolist() == pytest.approx([1.0, 1.0, 0.2, 1.0, 0.25, 1.0])
+    assert external[feb_28].tolist() == pytest.approx([2.0, 1.0, 0.4, 1.0, 0.10, 1.0])
+    assert torch.count_nonzero(augmented["missing"].forcings[:, -6:]) == 0
+
+    ndvi_only = EStreamsVegetationSnow(tmp_path).augment(
+        {"a": source["a"]}, ("estreams_ndvi",)
+    )["a"]
+    assert ndvi_only.forcing_names[-2:] == (
+        "estreams_ndvi", "estreams_ndvi_available",
+    )
+    assert ndvi_only.forcings.shape[1] == source["a"].forcings.shape[1] + 2
+
+    with pytest.raises(ValueError, match="at least one"):
+        EStreamsVegetationSnow(tmp_path).augment({"a": source["a"]}, ())
+
+
+def test_regional_run_can_add_estreams_features(tmp_path):
+    _write_estreams(tmp_path)
+    series = {"a": _series("a"), "target": _series("target", .4)}
+    catalog = CAMELSCHCatalog(".", [BasinCatalogRecord(key) for key in series])
+    config = RegionalExperimentConfig(
+        ".", BasinScopeConfig(("target",), "exclude_targets"), _dates(),
+        ModelArchitectureConfig(
+            complex_expert="mlp", simple_expert="fourier",
+            mlp_widths=(8,), fourier_frequencies=4,
+        ),
+        TrainingStrategyConfig("no_routing", 1, 1, 1, 1),
+        HyperparameterConfig(sequence_length=7, batch_size=128),
+        estreams_root=tmp_path,
+    )
+
+    result = run_regional_experiment(config, catalog=catalog, series_by_basin=series)
+
+    assert result.predictions and not result.failures
+    assert result.resolved_config["estreams_root"] == str(tmp_path)
+    assert result.resolved_config["analysis_task"] == "daily_discharge_forecasting"
+    assert result.resolved_config["feature_names"][3:9] == [
+        "estreams_lai", "estreams_lai_available",
+        "estreams_ndvi", "estreams_ndvi_available",
+        "estreams_snow_cover_fraction", "estreams_snow_cover_fraction_available",
+    ]
+
+
+def test_camels_chem_pressures_are_selectable_and_causally_aligned(tmp_path):
+    _write_camels_chem(tmp_path)
+    source = {"a": _series("a"), "missing": _series("missing")}
+    selected = (
+        "chem_agriculture_total_arable",
+        "chem_livestock_gve_per_ha",
+        "chem_deposition_n_total",
+        "chem_rain_delta_18o",
+    )
+
+    augmented = CAMELSCHChemPressures(tmp_path).augment(source, selected)
+
+    assert augmented["a"].forcing_names[-8:] == tuple(
+        item for feature in selected for item in (feature, f"{feature}_available")
+    )
+    jan_14 = augmented["a"].dates.index(date(2001, 1, 14))
+    jan_15 = augmented["a"].dates.index(date(2001, 1, 15))
+    values = augmented["a"].forcings[:, -8:]
+    assert values[jan_14].tolist() == pytest.approx([
+        100.0, 1.0, 0.5, 1.0, 20.0, 1.0, 0.0, 0.0,
+    ])
+    assert values[jan_15].tolist() == pytest.approx([
+        100.0, 1.0, 0.5, 1.0, 20.0, 1.0, -12.0, 1.0,
+    ])
+    assert torch.count_nonzero(augmented["missing"].forcings[:, -8:]) == 0
+    with pytest.raises(ValueError, match="at least one"):
+        CAMELSCHChemPressures(tmp_path).augment({"a": source["a"]}, ())
+
+
+def test_regional_run_can_add_camels_chem_features(tmp_path):
+    _write_camels_chem(tmp_path)
+    series = {"a": _series("a"), "target": _series("target", .4)}
+    catalog = CAMELSCHCatalog(".", [BasinCatalogRecord(key) for key in series])
+    config = RegionalExperimentConfig(
+        ".", BasinScopeConfig(("target",), "exclude_targets"), _dates(),
+        ModelArchitectureConfig(
+            complex_expert="mlp", simple_expert="fourier",
+            mlp_widths=(8,), fourier_frequencies=4,
+        ),
+        TrainingStrategyConfig("no_routing", 1, 1, 1, 1),
+        HyperparameterConfig(sequence_length=7, batch_size=128),
+        camels_chem_root=tmp_path,
+        camels_chem_features=("chem_livestock_gve_per_ha",),
+    )
+
+    result = run_regional_experiment(config, catalog=catalog, series_by_basin=series)
+
+    assert result.predictions and not result.failures
+    assert result.resolved_config["camels_chem_root"] == str(tmp_path)
+    assert "chem_livestock_gve_per_ha" in result.resolved_config["feature_names"]
 
 
 def test_scope_and_target_date_splits_are_leakage_free():
@@ -193,6 +390,30 @@ def test_gradio_values_include_kan_physics_controls():
     assert config.physics.kan_candidates == 4
     assert config.physics.robustness_noise_levels == (0.03, 0.1)
     assert config.physics.symbolic is False
+
+    configured = _config_from_ui_values(
+        "/data", ["target"], "targets_only",
+        [
+            *values,
+            True, "/mnt/c/Downloads/estreams_dataset", ["estreams_ndvi"],
+            True, "/mnt/c/Downloads/camels-ch-chem", ["chem_deposition_n_total"],
+        ],
+    )
+    assert configured.estreams_root == "/mnt/c/Downloads/estreams_dataset"
+    assert configured.estreams_features == ("estreams_ndvi",)
+    assert configured.camels_chem_root == "/mnt/c/Downloads/camels-ch-chem"
+    assert configured.camels_chem_features == ("chem_deposition_n_total",)
+
+    disabled = _config_from_ui_values(
+        "/data", ["target"], "targets_only",
+        [
+            *values,
+            False, "/invalid/path", ["estreams_ndvi"],
+            False, "/invalid/chem", ["chem_deposition_n_total"],
+        ],
+    )
+    assert disabled.estreams_root is None
+    assert disabled.camels_chem_root is None
 
 
 def test_established_basin_set_is_the_application_default():

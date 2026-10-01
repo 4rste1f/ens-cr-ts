@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from .camels_ch_chem import (
+    CAMELS_CH_CHEM_DYNAMIC_FEATURES, DEFAULT_CAMELS_CH_CHEM_FEATURES,
+    CAMELSCHChemPressures,
+)
+from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .regional import (
     BasinScopeConfig, CAMELSCHCatalog, CancellationToken, DateRange, DateSplitConfig,
     ExtremeEventConfig, HyperparameterConfig, ModelArchitectureConfig,
@@ -263,9 +268,29 @@ def _parse_floats(value: str) -> tuple[float, ...]:
     except ValueError as error: raise ValueError("values must be comma-separated numbers") from error
 
 
-def _config_from_ui_values(data_root: str | Path, target_values, scope_value, values):
+def _config_from_ui_values(
+    data_root: str | Path, target_values, scope_value, values,
+    *, estreams_root: str | Path | None = None,
+    camels_chem_root: str | Path | None = None,
+):
     """Translate the ordered Gradio component values into the typed service config."""
     widths = tuple(int(item.strip()) for item in values[22].split(",") if item.strip())
+    if len(values) > 50:
+        use_estreams = bool(values[48])
+        ui_estreams_root = str(values[49] or "").strip()
+        selected_estreams_features = tuple(values[50] or ())
+        resolved_estreams_root = ui_estreams_root if use_estreams else None
+    else:
+        resolved_estreams_root = estreams_root
+        selected_estreams_features = ESTREAMS_DYNAMIC_FEATURES
+    if len(values) > 53:
+        use_chem = bool(values[51])
+        ui_chem_root = str(values[52] or "").strip()
+        selected_chem_features = tuple(values[53] or ())
+        resolved_chem_root = ui_chem_root if use_chem else None
+    else:
+        resolved_chem_root = camels_chem_root
+        selected_chem_features = DEFAULT_CAMELS_CH_CHEM_FEATURES
     return RegionalExperimentConfig(
         data_root,
         BasinScopeConfig(tuple(target_values or ()), scope_value),
@@ -306,12 +331,18 @@ def _config_from_ui_values(data_root: str | Path, target_values, scope_value, va
         ),
         ExtremeEventConfig(values[28], values[32],
                            float(values[33]) if values[33] is not None else None),
+        estreams_root=resolved_estreams_root,
+        estreams_features=selected_estreams_features,
+        camels_chem_root=resolved_chem_root,
+        camels_chem_features=selected_chem_features,
     )
 
 
 def build_app(
     data_root: str | Path,
     *,
+    estreams_root: str | Path | None = None,
+    camels_chem_root: str | Path | None = None,
     save_results: bool = False,
     results_dir: str | Path = DEFAULT_RESULTS_DIRECTORY,
 ):
@@ -384,6 +415,74 @@ def build_app(
                 ("OOD fallback", "ood_fallback"),
                 ("Validation stacking", "stacking"),
             ], value="hard_routing", label="Physics-distillation teacher")
+        with gr.Tab("Data and features"):
+            gr.Markdown(
+                "CAMELS-CH daily hydrology is the required base dataset. Optional datasets "
+                "are read from their existing locations and are not copied into the project."
+            )
+            gr.Checkbox(True, label="CAMELS-CH daily hydrology (required)", interactive=False)
+            use_estreams = gr.Checkbox(
+                value=estreams_root is not None,
+                label="Include EStreams vegetation and snow",
+            )
+            estreams_path = gr.Textbox(
+                value=str(estreams_root or ""),
+                label="EStreams extracted dataset directory",
+                placeholder="/mnt/c/Users/.../Downloads/estreams_dataset",
+            )
+            estreams_features = gr.CheckboxGroup(
+                choices=[
+                    ("Leaf area index (LAI)", "estreams_lai"),
+                    ("Normalized difference vegetation index (NDVI)", "estreams_ndvi"),
+                    ("Snow-cover fraction", "estreams_snow_cover_fraction"),
+                ],
+                value=list(ESTREAMS_DYNAMIC_FEATURES),
+                label="EStreams dynamic features",
+            )
+            validate_estreams = gr.Button("Validate EStreams path")
+            estreams_status = gr.Markdown()
+            gr.Markdown("### CAMELS-CH-Chem catchment pressures")
+            use_camels_chem = gr.Checkbox(
+                value=camels_chem_root is not None,
+                label="Include CAMELS-CH-Chem land-use and deposition predictors",
+            )
+            camels_chem_path = gr.Textbox(
+                value=str(camels_chem_root or ""),
+                label="CAMELS-CH-Chem extracted dataset directory",
+                placeholder="/mnt/c/Users/.../Downloads/camels-ch-chem",
+            )
+            camels_chem_features = gr.CheckboxGroup(
+                choices=[
+                    ("Agriculture: cereal", "chem_agriculture_cereal"),
+                    ("Agriculture: maize", "chem_agriculture_maize"),
+                    ("Agriculture: sugar beet", "chem_agriculture_sugarbeet"),
+                    ("Agriculture: potato", "chem_agriculture_potato"),
+                    ("Agriculture: rapeseed", "chem_agriculture_rapeseed"),
+                    ("Agriculture: pulses", "chem_agriculture_pulse"),
+                    ("Agriculture: vegetables", "chem_agriculture_vegetable"),
+                    ("Agriculture: total arable", "chem_agriculture_total_arable"),
+                    ("Agriculture: grapevine", "chem_agriculture_grapevine"),
+                    ("Agriculture: orchard", "chem_agriculture_orchard"),
+                    ("Livestock: total GVE", "chem_livestock_gve"),
+                    ("Livestock: GVE per hectare", "chem_livestock_gve_per_ha"),
+                    ("Deposition: HNO3 gas", "chem_deposition_hno3_gas"),
+                    ("Deposition: NH3 gas", "chem_deposition_nh3_gas"),
+                    ("Deposition: NH4 total", "chem_deposition_nh4_total"),
+                    ("Deposition: NO2 gas", "chem_deposition_no2_gas"),
+                    ("Deposition: NO3 total", "chem_deposition_no3_total"),
+                    ("Deposition: total nitrogen", "chem_deposition_n_total"),
+                    ("Rain isotope: δ2H", "chem_rain_delta_2h"),
+                    ("Rain isotope: δ18O", "chem_rain_delta_18o"),
+                ],
+                value=list(DEFAULT_CAMELS_CH_CHEM_FEATURES),
+                label="CAMELS-CH-Chem predictors",
+            )
+            gr.Markdown(
+                "Annual predictors are lagged until year end to avoid future leakage. "
+                "Stream-water chemistry observations are not used as discharge predictors."
+            )
+            validate_camels_chem = gr.Button("Validate CAMELS-CH-Chem path")
+            camels_chem_status = gr.Markdown()
         with gr.Tab("Training hyperparameters"):
             with gr.Row():
                 sequence=gr.Number(30,precision=0,label="Sequence length"); seeds=gr.Textbox("0",label="Seeds")
@@ -414,11 +513,17 @@ def build_app(
                 kan_noise_levels=gr.Textbox("0.2",label="Robustness noise levels")
                 kan_accuracy_tolerance=gr.Number(.05,label="Robustness clean-AP tolerance")
                 kan_symbolic=gr.Checkbox(True,label="Extract symbolic KAN equation")
-        with gr.Tab("Extreme events"):
-            extreme_mode=gr.Radio([("None","none"),("Statistical","statistical"),("Structural — coming soon","structural")],value="none",label="Mode")
+        with gr.Tab("Task"):
+            extreme_mode=gr.Radio([
+                ("Daily discharge forecasting", "none"),
+                ("Daily discharge + statistical extreme-event evaluation", "statistical"),
+            ],value="none",label="Analysis task")
             definition=gr.Radio([("Automatic per-basin Q95","automatic_q95"),("Manual absolute discharge","absolute"),("Manual quantile","quantile")],value="automatic_q95",label="Definition")
             extreme_value=gr.Number(value=.95,label="Global value")
-            gr.Markdown("Per-basin threshold overrides are available through the Python service API.")
+            gr.Markdown(
+                "Threshold settings apply to the extreme-event task. Per-basin overrides "
+                "remain available through the Python service API."
+            )
         with gr.Tab("Results"):
             run=gr.Button("Run experiment",variant="primary"); cancel=gr.Button("Cancel")
             status=gr.Markdown()
@@ -522,6 +627,40 @@ def build_app(
         cancel.click(
             lambda token: (token.cancel() if token else None, "Cancellation requested.")[1],
             inputs=token_state, outputs=status, queue=False,
+        )
+
+        def validate_estreams_path(path):
+            if not str(path or "").strip():
+                return "Enter an EStreams dataset directory first."
+            try:
+                source = EStreamsVegetationSnow(path)
+            except (OSError, ValueError) as error:
+                return f"EStreams validation failed: {error}"
+            return (
+                f"EStreams layout is valid; {len(source.camels_gauge_ids)} "
+                "CAMELS-CH gauges are available."
+            )
+
+        validate_estreams.click(
+            validate_estreams_path, inputs=estreams_path, outputs=estreams_status,
+            queue=False,
+        )
+
+        def validate_camels_chem_path(path):
+            if not str(path or "").strip():
+                return "Enter a CAMELS-CH-Chem dataset directory first."
+            try:
+                source = CAMELSCHChemPressures(path)
+            except (OSError, ValueError) as error:
+                return f"CAMELS-CH-Chem validation failed: {error}"
+            return (
+                f"CAMELS-CH-Chem layout is valid; {len(source.gauge_ids)} "
+                "CAMELS-CH catchments are available."
+            )
+
+        validate_camels_chem.click(
+            validate_camels_chem_path, inputs=camels_chem_path,
+            outputs=camels_chem_status, queue=False,
         )
 
         def _selector_updates(values):
@@ -697,10 +836,12 @@ def build_app(
             )
 
         def execute(target_values, scope_value, token, *values, progress=gr.Progress()):
-            if values[28] == "structural":
-                raise gr.Error("Structural extreme-event analysis is coming soon")
             try:
-                config = _config_from_ui_values(data_root, target_values, scope_value, values)
+                config = _config_from_ui_values(
+                    data_root, target_values, scope_value, values,
+                    estreams_root=estreams_root,
+                    camels_chem_root=camels_chem_root,
+                )
                 result=run_regional_experiment(
                     config, lambda fraction,message: progress(fraction,desc=message), token
                 )
@@ -755,7 +896,7 @@ def build_app(
         def refresh_result_views(basin, result):
             return refresh_result(basin, result)[1:]
 
-        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage,physics_optimization,physics_teacher,kan_candidates,kan_steps,kan_grid,kan_order,kan_additive,kan_multiplicative,kan_sparsity,kan_noise_levels,kan_accuracy_tolerance,kan_symbolic]
+        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage,physics_optimization,physics_teacher,kan_candidates,kan_steps,kan_grid,kan_order,kan_additive,kan_multiplicative,kan_sparsity,kan_noise_levels,kan_accuracy_tolerance,kan_symbolic,use_estreams,estreams_path,estreams_features,use_camels_chem,camels_chem_path,camels_chem_features]
         prepare = run.click(lambda: CancellationToken(), outputs=token_state, queue=False)
         prepare.then(execute, inputs=[targets, scope, token_state, *inputs[2:]],
             outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,
@@ -779,6 +920,14 @@ def build_app(
 def main() -> None:
     parser=argparse.ArgumentParser(description="Launch the regional CAMELS-CH Gradio application")
     parser.add_argument("--data-root",type=Path,default=os.environ.get("CAMELS_CH_ROOT"))
+    parser.add_argument(
+        "--estreams-root", type=Path, default=os.environ.get("ESTREAMS_ROOT"),
+        help="Read EStreams vegetation and snow from this extracted dataset directory",
+    )
+    parser.add_argument(
+        "--camels-chem-root", type=Path, default=os.environ.get("CAMELS_CH_CHEM_ROOT"),
+        help="Read CAMELS-CH-Chem pressures from this extracted dataset directory",
+    )
     parser.add_argument("--host",default="127.0.0.1"); parser.add_argument("--port",type=int,default=7860)
     parser.add_argument(
         "--save-results", type=parse_bool, default=False, metavar="true|false",
@@ -792,7 +941,9 @@ def main() -> None:
     if args.data_root is None: parser.error("--data-root or CAMELS_CH_ROOT is required")
     CAMELSCHCatalog.validate_layout(args.data_root)
     build_app(
-        args.data_root, save_results=args.save_results, results_dir=args.results_dir,
+        args.data_root, estreams_root=args.estreams_root,
+        camels_chem_root=args.camels_chem_root,
+        save_results=args.save_results, results_dir=args.results_dir,
     ).launch(server_name=args.host,server_port=args.port,share=True)
 
 

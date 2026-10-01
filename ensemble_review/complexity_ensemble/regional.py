@@ -22,9 +22,14 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 import torch
 
+from .camels_ch_chem import (
+    CAMELS_CH_CHEM_DYNAMIC_FEATURES, DEFAULT_CAMELS_CH_CHEM_FEATURES,
+    CAMELSCHChemPressures,
+)
 from .hydrology import HydrologyRoutedOutput, RoutedHydrologyModel
 from .hydrology_comparison import _add_observation_noise, _metrics
 from .hydrology_data import HydrologySeries, load_camels_ch
+from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .hydrology_extreme_comparison import extreme_metrics
 from .hydrology_hard_routing_consolidation_comparison import hard_routed_losses
 from .ood import MahalanobisOODDetector
@@ -157,6 +162,10 @@ class RegionalExperimentConfig:
     hyperparameters: HyperparameterConfig = field(default_factory=HyperparameterConfig)
     physics: PhysicsModelConfig = field(default_factory=PhysicsModelConfig)
     extremes: ExtremeEventConfig = field(default_factory=ExtremeEventConfig)
+    estreams_root: str | Path | None = None
+    estreams_features: tuple[str, ...] = ESTREAMS_DYNAMIC_FEATURES
+    camels_chem_root: str | Path | None = None
+    camels_chem_features: tuple[str, ...] = DEFAULT_CAMELS_CH_CHEM_FEATURES
 
     def validate(self) -> None:
         targets = tuple(dict.fromkeys(map(str, self.basins.target_basins)))
@@ -241,6 +250,20 @@ class RegionalExperimentConfig:
             not 0 < value < 1 for value in values
         ):
             raise ValueError("quantiles must be strictly between zero and one")
+        unknown_estreams = set(self.estreams_features) - set(ESTREAMS_DYNAMIC_FEATURES)
+        if unknown_estreams:
+            raise ValueError(f"unknown EStreams features: {sorted(unknown_estreams)}")
+        if self.estreams_root is not None and not self.estreams_features:
+            raise ValueError("enabled EStreams integration requires at least one feature")
+        unknown_chem = set(self.camels_chem_features) - set(
+            CAMELS_CH_CHEM_DYNAMIC_FEATURES
+        )
+        if unknown_chem:
+            raise ValueError(f"unknown CAMELS-CH-Chem features: {sorted(unknown_chem)}")
+        if self.camels_chem_root is not None and not self.camels_chem_features:
+            raise ValueError(
+                "enabled CAMELS-CH-Chem integration requires at least one feature"
+            )
 
 
 @dataclass(frozen=True)
@@ -837,10 +860,20 @@ def _teacher_prediction(
 def _resolved(config: RegionalExperimentConfig, data: RegionalHydrologyData) -> dict[str, object]:
     value = asdict(config)
     value["data_root"] = str(config.data_root)
+    value["analysis_task"] = (
+        "daily_discharge_with_extremes"
+        if config.extremes.mode == "statistical"
+        else "daily_discharge_forecasting"
+    )
+    if config.estreams_root is not None:
+        value["estreams_root"] = str(config.estreams_root)
+    if config.camels_chem_root is not None:
+        value["camels_chem_root"] = str(config.camels_chem_root)
     for split in ("train", "validation", "test"):
         item = value["dates"][split]  # type: ignore[index]
         item["start"], item["end"] = str(item["start"]), str(item["end"])
     value["effective_training_basins"] = list(data.training_basins)
+    value["feature_names"] = list(data.feature_names)
     value["static_feature_names"] = list(data.static_feature_names)
     return value
 
@@ -873,6 +906,14 @@ def run_regional_experiment(
                 if basin in target_set:
                     raise ValueError(message) from error
                 load_failures.append(message)
+    if config.estreams_root is not None:
+        series = EStreamsVegetationSnow(config.estreams_root).augment(
+            series, config.estreams_features
+        )
+    if config.camels_chem_root is not None:
+        series = CAMELSCHChemPressures(config.camels_chem_root).augment(
+            series, config.camels_chem_features
+        )
     loaded = tuple(basin for basin in relevant if basin in series)
     attrs = {basin: catalog.get(basin).static_attributes for basin in loaded}
     data = make_regional_hydrology_data(series, attrs, config.basins, config.dates,
