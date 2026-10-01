@@ -404,6 +404,20 @@ def test_gradio_values_include_kan_physics_controls():
     assert configured.camels_chem_root == "/mnt/c/Downloads/camels-ch-chem"
     assert configured.camels_chem_features == ("chem_deposition_n_total",)
 
+    event_setup = _config_from_ui_values(
+        "/data", ["target"], "targets_only",
+        [
+            *values,
+            False, "", ["estreams_ndvi"], False, "", ["chem_deposition_n_total"],
+            "rolling", 14, ["low_flow_spell", "rapid_rise"],
+            0.85, 0.15, 0.9, 5, 4, 2,
+        ],
+    )
+    assert event_setup.forecast.mode == "rolling"
+    assert event_setup.forecast.horizon_days == 14
+    assert event_setup.extremes.event_types == ("low_flow_spell", "rapid_rise")
+    assert event_setup.extremes.minimum_days == 5
+
     disabled = _config_from_ui_values(
         "/data", ["target"], "targets_only",
         [

@@ -45,6 +45,8 @@ def _result(approach="ood_fallback", epochs=100, physics="none"):
         extreme_events=[], failures=[],
         resolved_config=_config(approach, epochs, physics),
         parameter_count=123, runtime_seconds=4.5,
+        forecast_metrics={"1": {"samples": 4, "nse": 0.8, "kge": 0.7,
+                                "rmse_mm_day": 0.1}},
     )
 
 
@@ -58,6 +60,7 @@ def test_registry_round_trip_and_leaderboard(tmp_path):
     assert (saved.path / "run.json").is_file()
     assert (saved.path / "predictions.csv").is_file()
     assert (saved.path / "regional_experiment.zip").is_file()
+    assert saved.forecast_metrics["1"]["samples"] == 4
     assert leaderboard_rows(snapshot.runs)[0][2:7] == [
         "ood_fallback", "mlp", "rbf", "100", "none",
     ]

@@ -14,11 +14,12 @@ from .camels_ch_chem import (
     CAMELSCHChemPressures,
 )
 from .design import launch_style
+from .design.config_help import config_info
 from .design.dataset_help import dataset_info
 from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .regional import (
     BasinScopeConfig, CAMELSCHCatalog, CancellationToken, DateRange, DateSplitConfig,
-    ExtremeEventConfig, HyperparameterConfig, ModelArchitectureConfig,
+    ExtremeEventConfig, ForecastConfig, HyperparameterConfig, ModelArchitectureConfig,
     PhysicsModelConfig, RegionalExperimentConfig, TrainingStrategyConfig,
     run_regional_experiment,
 )
@@ -332,12 +333,26 @@ def _config_from_ui_values(
             ),
             symbolic=bool(values[47]) if len(values) > 47 else True,
         ),
-        ExtremeEventConfig(values[28], values[32],
-                           float(values[33]) if values[33] is not None else None),
+        ExtremeEventConfig(
+            values[28], values[32],
+            float(values[33]) if values[33] is not None else None,
+            event_types=tuple(values[56]) if len(values) > 56 else ExtremeEventConfig().event_types,
+            high_quantile=float(values[57]) if len(values) > 57 else 0.8,
+            low_quantile=float(values[58]) if len(values) > 58 else 0.2,
+            rise_quantile=float(values[59]) if len(values) > 59 else 0.95,
+            fall_quantile=float(values[63]) if len(values) > 63 else 0.95,
+            minimum_days=int(values[60]) if len(values) > 60 else 3,
+            pulse_gap_days=int(values[61]) if len(values) > 61 else 7,
+            minimum_basins=int(values[62]) if len(values) > 62 else 2,
+        ),
         estreams_root=resolved_estreams_root,
         estreams_features=selected_estreams_features,
         camels_chem_root=resolved_chem_root,
         camels_chem_features=selected_chem_features,
+        forecast=ForecastConfig(
+            mode=values[54] if len(values) > 54 else "one_day",
+            horizon_days=int(values[55]) if len(values) > 55 else 7,
+        ),
     )
 
 
@@ -387,37 +402,52 @@ def build_app(
                 value=[[x.basin_id, x.name, x.eligible] for x in catalog.records], interactive=False)
         with gr.Tab("Experiment configuration"):
             with gr.Row():
+                gr.Markdown("### Date ranges")
+                config_info(gr, "dates")
+            with gr.Row():
                 train_start=gr.Textbox("2010-01-01",label="Train start"); train_end=gr.Textbox("2016-08-06",label="Train end")
                 val_start=gr.Textbox("2016-08-07",label="Validation start"); val_end=gr.Textbox("2018-10-18",label="Validation end")
                 test_start=gr.Textbox("2018-10-19",label="Test start"); test_end=gr.Textbox("2020-12-31",label="Test end")
-            approach=gr.Radio([
-                ("Soft routing","soft_routing"),
-                ("Hard routing","hard_routing"),
-                ("Distillation","distillation"),
-                ("No routing — complex only","no_routing"),
-                ("Static 50/50 — independently trained","static_50_50"),
-                ("OOD fallback — simple when OOD","ood_fallback"),
-                ("Stacking — validation-optimized blend","stacking"),
-            ],value="soft_routing",label="Approach")
-            complex_expert=gr.Radio([("Mamba","pinnmamba"),("MLP","mlp")],value="pinnmamba",label="Complex expert")
-            simple_expert=gr.Radio([("RBF","rbf"),("Fourier","fourier")],value="rbf",label="Simple expert")
-            gr.Dropdown([("Linear reservoir water balance","linear_reservoir")],value="linear_reservoir",label="Physics backbone",interactive=False)
-            physics_optimization=gr.Radio([
-                ("Linear reservoir only", "none"),
-                ("KAN — maximum accuracy", "accuracy"),
-                ("KAN — maximum robustness", "robustness"),
-                ("KAN — balanced", "balanced"),
-                ("KAN — physics distillation", "distillation"),
-            ], value="none", label="Physics optimization")
-            physics_teacher=gr.Dropdown([
-                ("Morse soft routing", "soft_routing"),
-                ("Morse hard routing", "hard_routing"),
-                ("Existing expert distillation", "distillation"),
-                ("Complex expert only", "no_routing"),
-                ("Static 50/50", "static_50_50"),
-                ("OOD fallback", "ood_fallback"),
-                ("Validation stacking", "stacking"),
-            ], value="hard_routing", label="Physics-distillation teacher")
+            with gr.Row():
+                approach=gr.Radio([
+                    ("Soft routing","soft_routing"),
+                    ("Hard routing","hard_routing"),
+                    ("Distillation","distillation"),
+                    ("No routing — complex only","no_routing"),
+                    ("Static 50/50 — independently trained","static_50_50"),
+                    ("OOD fallback — simple when OOD","ood_fallback"),
+                    ("Stacking — validation-optimized blend","stacking"),
+                ],value="soft_routing",label="Approach")
+                config_info(gr, "approach")
+            with gr.Row():
+                complex_expert=gr.Radio([("Mamba","pinnmamba"),("MLP","mlp")],value="pinnmamba",label="Complex expert")
+                config_info(gr, "complex_expert")
+            with gr.Row():
+                simple_expert=gr.Radio([("RBF","rbf"),("Fourier","fourier")],value="rbf",label="Simple expert")
+                config_info(gr, "simple_expert")
+            with gr.Row():
+                gr.Dropdown([("Linear reservoir water balance","linear_reservoir")],value="linear_reservoir",label="Physics backbone",interactive=False)
+                config_info(gr, "physics_backbone")
+            with gr.Row():
+                physics_optimization=gr.Radio([
+                    ("Linear reservoir only", "none"),
+                    ("KAN — maximum accuracy", "accuracy"),
+                    ("KAN — maximum robustness", "robustness"),
+                    ("KAN — balanced", "balanced"),
+                    ("KAN — physics distillation", "distillation"),
+                ], value="none", label="Physics optimization")
+                config_info(gr, "physics_optimization")
+            with gr.Row():
+                physics_teacher=gr.Dropdown([
+                    ("Morse soft routing", "soft_routing"),
+                    ("Morse hard routing", "hard_routing"),
+                    ("Existing expert distillation", "distillation"),
+                    ("Complex expert only", "no_routing"),
+                    ("Static 50/50", "static_50_50"),
+                    ("OOD fallback", "ood_fallback"),
+                    ("Validation stacking", "stacking"),
+                ], value="hard_routing", label="Physics-distillation teacher")
+                config_info(gr, "physics_teacher")
         with gr.Tab("Data and features"):
             gr.Markdown(
                 "CAMELS-CH daily hydrology is the required base dataset. Optional datasets "
@@ -526,13 +556,46 @@ def build_app(
             extreme_mode=gr.Radio([
                 ("Daily discharge forecasting", "none"),
                 ("Daily discharge + statistical extreme-event evaluation", "statistical"),
+                ("Daily discharge + hydrological event evaluation", "event_based"),
             ],value="none",label="Analysis task")
             definition=gr.Radio([("Automatic per-basin Q95","automatic_q95"),("Manual absolute discharge","absolute"),("Manual quantile","quantile")],value="automatic_q95",label="Definition")
             extreme_value=gr.Number(value=.95,label="Global value")
             gr.Markdown(
-                "Threshold settings apply to the extreme-event task. Per-basin overrides "
+                "The definition and global value above apply to statistical extremes. Per-basin overrides "
                 "remain available through the Python service API."
             )
+            with gr.Accordion("Hydrological event definitions", open=False):
+                event_types=gr.CheckboxGroup([
+                    ("Sustained high flow", "high_flow_spell"),
+                    ("Low-flow drought", "low_flow_spell"),
+                    ("Rapid daily rise", "rapid_rise"),
+                    ("Rapid daily fall", "rapid_fall"),
+                    ("Repeated high-flow pulses", "repeated_high_flow"),
+                    ("Concurrent high flow across basins", "regional_concurrence"),
+                    ("Concurrent low flow across basins", "regional_low_flow"),
+                ], value=["high_flow_spell", "low_flow_spell", "rapid_rise",
+                          "rapid_fall", "repeated_high_flow", "regional_concurrence",
+                          "regional_low_flow"],
+                   label="Event types")
+                with gr.Row():
+                    high_quantile=gr.Number(.8, label="High-flow training quantile")
+                    low_quantile=gr.Number(.2, label="Low-flow training quantile")
+                    rise_quantile=gr.Number(.95, label="Daily-rise training quantile")
+                    fall_quantile=gr.Number(.95, label="Daily-fall training quantile")
+                with gr.Row():
+                    minimum_days=gr.Number(3, precision=0, label="Minimum spell days")
+                    pulse_gap_days=gr.Number(7, precision=0, label="Maximum gap between pulses (days)")
+                    minimum_basins=gr.Number(2, precision=0, label="Minimum concurrent basins")
+                gr.Markdown("Thresholds are estimated from each basin's training-period observations. "
+                            "Rapid rise uses day-to-day discharge change; regional events need enough selected basins.")
+            forecast_mode=gr.Radio([
+                ("One-day forecast (observed discharge history)", "one_day"),
+                ("Rolling multi-day hindcast", "rolling"),
+            ], value="one_day", label="Forecast setup")
+            horizon_days=gr.Number(7, precision=0, label="Rolling forecast horizon (days)")
+            gr.Markdown("Rolling forecasts replace future observed discharge with the model's own predictions. "
+                        "They use historical weather observations for future days, so they are perfect-weather "
+                        "hindcasts rather than operational forecasts.")
         with gr.Tab("Results"):
             run=gr.Button("Run experiment",variant="primary"); cancel=gr.Button("Cancel")
             status=gr.Markdown()
@@ -612,6 +675,37 @@ def build_app(
                 aggregate_chart = gr.Plot(label="Aggregate metrics")
                 basin_chart = gr.Plot(label="Per-basin comparison")
             loss_comparison = gr.Plot(label="Saved loss traces")
+
+        with gr.Tab("About the platform"):
+            gr.Markdown("""
+## Regional hydrology experiments
+
+This platform explores daily discharge prediction across CAMELS-CH basins. Select
+prediction targets and training basins, choose time periods and data sources,
+then compare how different model setups perform on held-out dates. Optional
+EStreams vegetation and snow data and CAMELS-CH-Chem catchment pressures add
+predictors; discharge remains the prediction target.
+
+### Models and approach
+
+- **Complex expert:** a sequence-based Mamba model or a multilayer perceptron (MLP).
+- **Simple expert:** a radial basis function (RBF) or Fourier-feature model.
+- **Routing:** a hydrology-based complexity score can blend the experts or select
+  one for each input. Other approaches train a complex teacher and distill it,
+  use one expert, average the experts, fall back to the simple expert for
+  out-of-distribution inputs, or fit a blend on validation data.
+- **Physics:** a linear reservoir water balance supplies a training constraint.
+  Optional KAN optimization learns a correction to that balance.
+
+### What you can inspect
+
+Run results include basin maps, observed-versus-predicted discharge plots,
+expert usage, loss traces, discharge metrics, and optional hydrological event
+scores. One-day forecasts can be compared with rolling multi-day hindcasts.
+You can export predictions,
+metrics, and the resolved configuration. When persistent saving is enabled,
+the leaderboard lets you revisit and compare saved runs.
+""")
 
         def selection_payload(value):
             selected = [str(item) for item in (value or ()) if str(item) in eligible]
@@ -845,6 +939,8 @@ def build_app(
             )
 
         def execute(target_values, scope_value, token, *values, progress=gr.Progress()):
+            import pandas as pd
+
             try:
                 config = _config_from_ui_values(
                     data_root, target_values, scope_value, values,
@@ -881,7 +977,7 @@ def build_app(
             basin,historical,future,hydro,points,route,losses=result_views(
                 result, (target_values or [None])[0]
             )
-            metric_value={"aggregate":result.aggregate_metrics,"per_basin":result.per_basin_metrics,"routing":result.routing_diagnostics,"parameters":result.parameter_count,"runtime_seconds":result.runtime_seconds,"failures":result.failures}
+            metric_value={"aggregate":result.aggregate_metrics,"per_basin":result.per_basin_metrics,"by_lead_day":result.forecast_metrics,"routing":result.routing_diagnostics,"parameters":result.parameter_count,"runtime_seconds":result.runtime_seconds,"failures":result.failures}
             file_values = (
                 [str(paths[key]) for key in ("predictions", "metrics", "config", "archive")]
                 if paths is not None else [None, None, None, None]
@@ -889,7 +985,7 @@ def build_app(
             registry_message = f"Loaded {len(saved_runs)} saved run(s)."
             return (
                 token, result, message, historical, future, basin, hydro, points, route,
-                losses, metric_value, result.extreme_events, *file_values,
+                losses, metric_value, pd.DataFrame(result.extreme_events), *file_values,
                 leaderboard_rows(saved_runs), registry_message,
             )
 
@@ -905,7 +1001,7 @@ def build_app(
         def refresh_result_views(basin, result):
             return refresh_result(basin, result)[1:]
 
-        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage,physics_optimization,physics_teacher,kan_candidates,kan_steps,kan_grid,kan_order,kan_additive,kan_multiplicative,kan_sparsity,kan_noise_levels,kan_accuracy_tolerance,kan_symbolic,use_estreams,estreams_path,estreams_features,use_camels_chem,camels_chem_path,camels_chem_features]
+        inputs=[targets,scope,train_start,train_end,val_start,val_end,test_start,test_end,approach,complex_expert,simple_expert,epochs,sequence,seeds,batch,learning_rate,noise,percentile,temperature,physics_weight,interface_weight,teacher_epochs,distill_epochs,consolidation_epochs,mlp_widths,mamba_hidden,mamba_layers,mamba_ff,rbf_centers,fourier_frequencies,extreme_mode,routing_weight,compute_weight,device,definition,extreme_value,ood_quantile,ood_shrinkage,physics_optimization,physics_teacher,kan_candidates,kan_steps,kan_grid,kan_order,kan_additive,kan_multiplicative,kan_sparsity,kan_noise_levels,kan_accuracy_tolerance,kan_symbolic,use_estreams,estreams_path,estreams_features,use_camels_chem,camels_chem_path,camels_chem_features,forecast_mode,horizon_days,event_types,high_quantile,low_quantile,rise_quantile,minimum_days,pulse_gap_days,minimum_basins,fall_quantile]
         prepare = run.click(lambda: CancellationToken(), outputs=token_state, queue=False)
         prepare.then(execute, inputs=[targets, scope, token_state, *inputs[2:]],
             outputs=[token_state,experiment_state,status,historical_map,future_map,active_basin,

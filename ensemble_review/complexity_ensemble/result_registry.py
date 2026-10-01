@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
@@ -36,6 +36,8 @@ FILTER_FIELDS: tuple[tuple[str, str], ...] = (
     ("hyperparameters.learning_rate", "Learning rate"),
     ("hyperparameters.training_noise", "Training noise"),
     ("extremes.mode", "Extreme-event mode"),
+    ("forecast.mode", "Forecast setup"),
+    ("forecast.horizon_days", "Rolling horizon"),
 )
 
 
@@ -95,6 +97,7 @@ class SavedRun:
     parameter_count: int
     runtime_seconds: float
     cancelled: bool
+    forecast_metrics: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
     def value(self, field: str) -> str:
         return display_value(_nested(self.config, field))
@@ -142,6 +145,7 @@ def save_run(result: ExperimentResult, directory: str | Path = DEFAULT_RESULTS_D
             "routing_diagnostics": result.routing_diagnostics,
             "loss_traces": result.loss_traces,
             "extreme_events": result.extreme_events,
+            "forecast_metrics": result.forecast_metrics,
             "failures": result.failures,
             "parameter_count": result.parameter_count,
             "runtime_seconds": result.runtime_seconds,
@@ -178,6 +182,7 @@ def load_run(path: str | Path) -> SavedRun:
         list(payload.get("extreme_events", [])), list(payload.get("failures", [])),
         int(payload.get("parameter_count", 0)), float(payload.get("runtime_seconds", 0.0)),
         bool(payload.get("cancelled", False)),
+        {str(key): dict(value) for key, value in payload.get("forecast_metrics", {}).items()},
     )
 
 

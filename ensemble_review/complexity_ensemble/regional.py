@@ -31,6 +31,7 @@ from .hydrology_comparison import _add_observation_noise, _metrics
 from .hydrology_data import HydrologySeries, load_camels_ch
 from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .hydrology_extreme_comparison import extreme_metrics
+from .hydrology_events import EVENT_TYPES, basin_event_metrics, regional_event_metrics
 from .hydrology_hard_routing_consolidation_comparison import hard_routed_losses
 from .ood import MahalanobisOODDetector
 from .stacking import fit_convex_stacking_weight
@@ -150,6 +151,20 @@ class ExtremeEventConfig:
     definition: str = "automatic_q95"
     value: float | None = None
     per_basin_values: Mapping[str, float] = field(default_factory=dict)
+    event_types: tuple[str, ...] = EVENT_TYPES
+    high_quantile: float = 0.8
+    low_quantile: float = 0.2
+    rise_quantile: float = 0.95
+    fall_quantile: float = 0.95
+    minimum_days: int = 3
+    pulse_gap_days: int = 7
+    minimum_basins: int = 2
+
+
+@dataclass(frozen=True)
+class ForecastConfig:
+    mode: str = "one_day"
+    horizon_days: int = 7
 
 
 @dataclass(frozen=True)
@@ -166,6 +181,7 @@ class RegionalExperimentConfig:
     estreams_features: tuple[str, ...] = ESTREAMS_DYNAMIC_FEATURES
     camels_chem_root: str | Path | None = None
     camels_chem_features: tuple[str, ...] = DEFAULT_CAMELS_CH_CHEM_FEATURES
+    forecast: ForecastConfig = field(default_factory=ForecastConfig)
 
     def validate(self) -> None:
         targets = tuple(dict.fromkeys(map(str, self.basins.target_basins)))
@@ -237,8 +253,18 @@ class RegionalExperimentConfig:
             and not self.physics.robustness_noise_levels
         ):
             raise ValueError("robustness and balanced KAN modes require noise levels")
-        if self.extremes.mode not in {"none", "statistical"}:
-            raise ValueError("extreme mode must be 'none' or 'statistical'")
+        if self.extremes.mode not in {"none", "statistical", "event_based"}:
+            raise ValueError("extreme mode must be 'none', 'statistical', or 'event_based'")
+        if self.forecast.mode not in {"one_day", "rolling"} or self.forecast.horizon_days < 2:
+            raise ValueError("forecast mode or horizon days are invalid")
+        if (self.extremes.mode == "event_based" and
+                (not self.extremes.event_types or set(self.extremes.event_types) - set(EVENT_TYPES)
+                or not 0 < self.extremes.low_quantile < self.extremes.high_quantile < 1
+                or not 0 < self.extremes.rise_quantile < 1
+                or not 0 < self.extremes.fall_quantile < 1
+                or self.extremes.minimum_days < 1 or self.extremes.pulse_gap_days < 0
+                or self.extremes.minimum_basins < 2)):
+            raise ValueError("event definitions or thresholds are invalid")
         if self.extremes.definition not in {"automatic_q95", "absolute", "quantile"}:
             raise ValueError("unknown extreme-event definition")
         values = list(self.extremes.per_basin_values.values())
@@ -591,6 +617,8 @@ class PredictionRecord:
     physics_error: float = float("nan")
     ood_score: float = float("nan")
     ood_threshold: float = float("nan")
+    issue_date: date | None = None
+    lead_day: int = 1
 
 
 @dataclass
@@ -607,6 +635,7 @@ class ExperimentResult:
     runtime_seconds: float = 0.0
     cancelled: bool = False
     artifact_paths: dict[str, str] = field(default_factory=dict)
+    forecast_metrics: dict[str, dict[str, float | int]] = field(default_factory=dict)
 
 
 ProgressCallback = Callable[[float, str], None]
@@ -807,6 +836,34 @@ def _thresholds(config: ExtremeEventConfig, targets: tuple[str, ...],
     return result
 
 
+def _event_thresholds(config: ExtremeEventConfig, targets: tuple[str, ...],
+                      series: Mapping[str, HydrologySeries], train_range: DateRange
+                      ) -> dict[str, tuple[float, float, float, float]]:
+    period = train_range.resolved()
+    thresholds = {}
+    for basin in targets:
+        days = series[basin].dates
+        flow = series[basin].discharge
+        indices = [index for index, day in enumerate(days) if period.contains(day)]
+        if not indices:
+            raise ValueError(f"no training-period observations for basin {basin}")
+        values = flow[indices]
+        changes = torch.tensor([
+            float(flow[index] - flow[index - 1])
+            for index in indices if index > 0 and period.contains(days[index - 1])
+            and days[index] == days[index - 1] + timedelta(days=1)
+        ])
+        if not len(changes):
+            raise ValueError(f"no consecutive training-period observations for basin {basin}")
+        thresholds[basin] = (
+            float(torch.quantile(values, config.high_quantile)),
+            float(torch.quantile(values, config.low_quantile)),
+            float(torch.quantile(changes.clamp_min(0), config.rise_quantile)),
+            float(torch.quantile((-changes).clamp_min(0), config.fall_quantile)),
+        )
+    return thresholds
+
+
 def _teacher_prediction(
     model: RoutedHydrologyModel,
     split: RegionalSplit,
@@ -857,12 +914,107 @@ def _teacher_prediction(
         return torch.lerp(simple_prediction, complex_prediction, weight[:, None]).squeeze(-1)
 
 
+def _predict_with_approach(
+    model: RoutedHydrologyModel, inputs: torch.Tensor, static: torch.Tensor,
+    approach: str, *, stacking_weight: float | None = None,
+    ood_detector: MahalanobisOODDetector | None = None,
+) -> tuple[HydrologyRoutedOutput, torch.Tensor]:
+    """Apply one trained approach to a batch of normalized input windows."""
+    ood_score = torch.full((len(inputs),), float("nan"), device=inputs.device)
+    if approach not in {"no_routing", "static_50_50", "ood_fallback", "stacking"}:
+        output = model(inputs, return_details=True, static_inputs=static,
+                       hard=approach == "hard_routing")
+        assert isinstance(output, HydrologyRoutedOutput)
+        return output, ood_score
+    complex_raw = model.complex_expert(inputs, static)
+    complex_prediction = model._positive_discharge(complex_raw)
+    if approach == "no_routing":
+        simple_raw = torch.zeros_like(complex_raw)
+        simple_prediction = torch.zeros_like(complex_prediction)
+        weight = torch.ones(len(inputs), device=inputs.device)
+    else:
+        simple_raw = model.simple_expert(inputs, static)
+        simple_prediction = model._positive_discharge(simple_raw)
+        if approach == "static_50_50":
+            weight = torch.full((len(inputs),), 0.5, device=inputs.device)
+        elif approach == "stacking":
+            assert stacking_weight is not None
+            weight = torch.full((len(inputs),), stacking_weight, device=inputs.device)
+        else:
+            assert ood_detector is not None and ood_detector.threshold is not None
+            ood_score = ood_detector.score(inputs, static)
+            weight = (~ood_detector.is_ood(inputs, static)).to(inputs.dtype)
+    output = HydrologyRoutedOutput(
+        torch.lerp(simple_prediction, complex_prediction, weight[:, None]),
+        weight, simple_raw, complex_raw,
+    )
+    return output, ood_score
+
+
+def _rolling_test_predictions(
+    model: RoutedHydrologyModel, data: RegionalHydrologyData,
+    config: RegionalExperimentConfig, seed: int, device: torch.device,
+    *, stacking_weight: float | None, ood_detector: MahalanobisOODDetector | None,
+) -> list[PredictionRecord]:
+    """Forecast non-overlapping blocks, replacing future observed flow with predictions.
+
+    Future meteorological covariates are historical observations, so this is a
+    perfect-weather hindcast rather than an operational weather forecast.
+    """
+    result: list[PredictionRecord] = []
+    q_index = data.feature_names.index("previous_discharge")
+    scale = float(data.discharge_scale)
+    mean = float(data.feature_mean[q_index])
+    std = float(data.feature_scale[q_index])
+    horizon = config.forecast.horizon_days
+    for basin in data.target_basins:
+        indices = [index for index, item in enumerate(data.test.basin_ids) if item == basin]
+        indices.sort(key=lambda index: data.test.target_dates[index])
+        continuous: list[list[int]] = []
+        for index in indices:
+            if (not continuous or data.test.target_dates[index]
+                    != data.test.target_dates[continuous[-1][-1]] + timedelta(days=1)):
+                continuous.append([])
+            continuous[-1].append(index)
+        for segment in continuous:
+            for offset in range(0, len(segment), horizon):
+                block = segment[offset:offset + horizon]
+                issue_date = data.test.target_dates[block[0]] - timedelta(days=1)
+                predicted_flow: dict[date, float] = {}
+                for lead, index in enumerate(block, 1):
+                    day = data.test.target_dates[index]
+                    normalized = data.test.inputs[index:index + 1].to(device).clone()
+                    physical = data.test.physical_inputs[index:index + 1].to(device).clone()
+                    for sequence_index in range(normalized.shape[1]):
+                        input_date = day - timedelta(days=normalized.shape[1] - sequence_index)
+                        if input_date in predicted_flow:
+                            value = predicted_flow[input_date]
+                            physical[0, sequence_index, q_index] = value
+                            normalized[0, sequence_index, q_index] = (value - mean) / std
+                    static = data.test.static_inputs[index:index + 1].to(device)
+                    output, ood_score = _predict_with_approach(
+                        model, normalized, static, config.strategy.approach,
+                        stacking_weight=stacking_weight, ood_detector=ood_detector,
+                    )
+                    value = float(output.discharge[0, 0].cpu()) * scale
+                    predicted_flow[day] = value
+                    residual = float(model.physics_residual(output.discharge, physical).square()[0].cpu())
+                    result.append(PredictionRecord(
+                        seed, basin, day, float(data.test.targets[index]) * scale, value,
+                        float(output.complex_weight[0].cpu()), residual,
+                        float(ood_score[0].cpu()),
+                        float(ood_detector.threshold.cpu()) if ood_detector is not None else float("nan"),
+                        issue_date, lead,
+                    ))
+    return result
+
+
 def _resolved(config: RegionalExperimentConfig, data: RegionalHydrologyData) -> dict[str, object]:
     value = asdict(config)
     value["data_root"] = str(config.data_root)
     value["analysis_task"] = (
-        "daily_discharge_with_extremes"
-        if config.extremes.mode == "statistical"
+        "daily_discharge_with_extremes" if config.extremes.mode == "statistical"
+        else "daily_discharge_with_hydrological_events" if config.extremes.mode == "event_based"
         else "daily_discharge_forecasting"
     )
     if config.estreams_root is not None:
@@ -1072,84 +1224,57 @@ def run_regional_experiment(
             if _cancelled(cancellation_token): break
             model.eval()
             with torch.no_grad():
-                test_inputs = data.test.inputs.to(device)
-                test_static = data.test.static_inputs.to(device)
-                if config.strategy.approach in {
-                    "no_routing", "static_50_50", "ood_fallback", "stacking"
-                }:
-                    complex_raw = model.complex_expert(test_inputs, test_static)
-                    complex_prediction = model._positive_discharge(complex_raw)
-                    ood_score = torch.full(
-                        (len(test_inputs),), float("nan"), device=device
+                stacking_weight = None
+                if config.strategy.approach == "stacking":
+                    validation_inputs = data.validation.inputs.to(device)
+                    validation_static = data.validation.static_inputs.to(device)
+                    validation_simple = model._positive_discharge(
+                        model.simple_expert(validation_inputs, validation_static)
                     )
-                    seed_ood_threshold = float("nan")
-                    if config.strategy.approach == "no_routing":
-                        simple_raw = torch.zeros_like(complex_raw)
-                        simple_prediction = torch.zeros_like(complex_prediction)
-                        weight = torch.ones(len(test_inputs), device=device)
-                    else:
-                        simple_raw = model.simple_expert(test_inputs, test_static)
-                        simple_prediction = model._positive_discharge(simple_raw)
-                        if config.strategy.approach == "static_50_50":
-                            weight = torch.full((len(test_inputs),), 0.5, device=device)
-                        elif config.strategy.approach == "stacking":
-                            validation_inputs = data.validation.inputs.to(device)
-                            validation_static = data.validation.static_inputs.to(device)
-                            validation_simple = model._positive_discharge(
-                                model.simple_expert(validation_inputs, validation_static)
-                            )
-                            validation_complex = model._positive_discharge(
-                                model.complex_expert(validation_inputs, validation_static)
-                            )
-                            fitted_weight, validation_mse = fit_convex_stacking_weight(
-                                validation_simple,
-                                validation_complex,
-                                data.validation.targets.to(device),
-                            )
-                            weight = torch.full(
-                                (len(test_inputs),), fitted_weight, device=device
-                            )
-                            stacking_weights.append(fitted_weight)
-                            stacking_validation_mses.append(
-                                validation_mse * float(data.discharge_scale.square())
-                            )
-                        else:
-                            detector = MahalanobisOODDetector(
-                                config.hyperparameters.ood_quantile,
-                                config.hyperparameters.ood_shrinkage,
-                            ).fit(
-                                data.train.inputs.to(device), data.train.static_inputs.to(device)
-                            )
-                            ood_score = detector.score(test_inputs, test_static)
-                            weight = (~detector.is_ood(test_inputs, test_static)).to(test_inputs.dtype)
-                            assert detector.threshold is not None
-                            seed_ood_threshold = float(detector.threshold.cpu())
-                            ood_thresholds.append(seed_ood_threshold)
-                    discharge = torch.lerp(
-                        simple_prediction, complex_prediction, weight[:, None]
+                    validation_complex = model._positive_discharge(
+                        model.complex_expert(validation_inputs, validation_static)
                     )
-                    output = HydrologyRoutedOutput(
-                        discharge, weight, simple_raw, complex_raw
+                    stacking_weight, validation_mse = fit_convex_stacking_weight(
+                        validation_simple, validation_complex,
+                        data.validation.targets.to(device),
                     )
+                    stacking_weights.append(stacking_weight)
+                    stacking_validation_mses.append(
+                        validation_mse * float(data.discharge_scale.square())
+                    )
+                detector = None
+                if config.strategy.approach == "ood_fallback":
+                    detector = MahalanobisOODDetector(
+                        config.hyperparameters.ood_quantile,
+                        config.hyperparameters.ood_shrinkage,
+                    ).fit(data.train.inputs.to(device), data.train.static_inputs.to(device))
+                    assert detector.threshold is not None
+                    ood_thresholds.append(float(detector.threshold.cpu()))
+                if config.forecast.mode == "rolling":
+                    predictions.extend(_rolling_test_predictions(
+                        model, data, config, seed, device,
+                        stacking_weight=stacking_weight, ood_detector=detector,
+                    ))
                 else:
-                    ood_score = torch.full(
-                        (len(test_inputs),), float("nan"), device=device
+                    output, ood_score = _predict_with_approach(
+                        model, data.test.inputs.to(device), data.test.static_inputs.to(device),
+                        config.strategy.approach, stacking_weight=stacking_weight,
+                        ood_detector=detector,
                     )
-                    seed_ood_threshold = float("nan")
-                    output = model(test_inputs, return_details=True,
-                                   static_inputs=test_static,
-                                   hard=config.strategy.approach == "hard_routing")
-            assert isinstance(output, HydrologyRoutedOutput)
-            predicted = output.discharge.squeeze(-1).cpu() * data.discharge_scale
-            observed = data.test.targets * data.discharge_scale
-            residual = model.physics_residual(
-                output.discharge, data.test.physical_inputs.to(device)
-            ).square().cpu()
-            for index in range(len(predicted)):
-                predictions.append(PredictionRecord(seed, data.test.basin_ids[index],
-                    data.test.target_dates[index], float(observed[index]), float(predicted[index]),
-                    float(output.complex_weight[index].cpu()), float(residual[index]),
-                    float(ood_score[index].cpu()), seed_ood_threshold))
+                    predicted = output.discharge.squeeze(-1).cpu() * data.discharge_scale
+                    observed = data.test.targets * data.discharge_scale
+                    residual = model.physics_residual(
+                        output.discharge, data.test.physical_inputs.to(device)
+                    ).square().cpu()
+                    for index in range(len(predicted)):
+                        predictions.append(PredictionRecord(
+                            seed, data.test.basin_ids[index], data.test.target_dates[index],
+                            float(observed[index]), float(predicted[index]),
+                            float(output.complex_weight[index].cpu()), float(residual[index]),
+                            float(ood_score[index].cpu()),
+                            float(detector.threshold.cpu()) if detector is not None else float("nan"),
+                            data.test.target_dates[index] - timedelta(days=1), 1,
+                        ))
         except Exception as error:
             failures.append(f"seed {seed}: {error}")
     per_basin: dict[str, dict[str, float]] = {}
@@ -1197,19 +1322,77 @@ def run_regional_experiment(
     else: aggregate, routing = {}, {}
     resolved["fitted_diagnostics"] = dict(routing)
     extremes = []
-    for basin, threshold in _thresholds(config.extremes, data.target_basins, series, config.dates.train).items():
-        rows = [item for item in predictions if item.basin_id == basin]
-        # Metrics are evaluated per seed because repeated dates are not one event sequence.
+    if config.extremes.mode == "statistical":
+        for basin, threshold in _thresholds(config.extremes, data.target_basins, series, config.dates.train).items():
+            rows = [item for item in predictions if item.basin_id == basin]
+            # Metrics are evaluated per seed because repeated dates are not one event sequence.
+            for seed in config.hyperparameters.seeds:
+                selected = sorted((item for item in rows if item.seed == seed),
+                                  key=lambda item: item.target_date)
+                if selected:
+                    metrics = extreme_metrics(torch.tensor([x.predicted_mm_day for x in selected]),
+                        torch.tensor([x.observed_mm_day for x in selected]),
+                        tuple(x.target_date for x in selected), threshold)
+                    extremes.append({"basin_id": basin, "seed": seed, "event_type": "statistical_high_flow",
+                                     "threshold_mm_day": threshold, **metrics})
+    elif config.extremes.mode == "event_based":
+        thresholds = _event_thresholds(config.extremes, data.target_basins,
+                                       series, config.dates.train)
         for seed in config.hyperparameters.seeds:
-            selected = [item for item in rows if item.seed == seed]
-            if selected:
-                metrics = extreme_metrics(torch.tensor([x.predicted_mm_day for x in selected]),
-                    torch.tensor([x.observed_mm_day for x in selected]),
-                    tuple(x.target_date for x in selected), threshold)
-                extremes.append({"basin_id": basin, "seed": seed, "threshold_mm_day": threshold, **metrics})
+            rows_by_basin = {}
+            for basin in data.target_basins:
+                selected = sorted((item for item in predictions
+                                   if item.seed == seed and item.basin_id == basin),
+                                  key=lambda item: item.target_date)
+                if not selected:
+                    continue
+                rows_by_basin[basin] = [(item.target_date, item.observed_mm_day,
+                                        item.predicted_mm_day) for item in selected]
+                high, low, rise, fall = thresholds[basin]
+                for event_type in config.extremes.event_types:
+                    if event_type in {"regional_concurrence", "regional_low_flow"}:
+                        continue
+                    metrics = basin_event_metrics(
+                        [item.target_date for item in selected],
+                        [item.observed_mm_day for item in selected],
+                        [item.predicted_mm_day for item in selected],
+                        event_type=event_type, high_threshold=high,
+                        low_threshold=low, rise_threshold=rise, fall_threshold=fall,
+                        minimum_days=config.extremes.minimum_days,
+                        pulse_gap_days=config.extremes.pulse_gap_days,
+                    )
+                    extremes.append({"basin_id": basin, "seed": seed,
+                                     "event_type": event_type,
+                                     "high_threshold_mm_day": high,
+                                     "low_threshold_mm_day": low,
+                                     "rise_threshold_mm_day": rise,
+                                     "fall_threshold_mm_day": fall, **metrics})
+            if len(rows_by_basin) >= config.extremes.minimum_basins:
+                for event_type, threshold_index, direction in (
+                    ("regional_concurrence", 0, "high"),
+                    ("regional_low_flow", 1, "low"),
+                ):
+                    if event_type in config.extremes.event_types:
+                        metrics = regional_event_metrics(
+                            rows_by_basin,
+                            {basin: thresholds[basin][threshold_index] for basin in rows_by_basin},
+                            config.extremes.minimum_basins, config.extremes.minimum_days,
+                            direction=direction,
+                        )
+                        extremes.append({"basin_id": "all", "seed": seed,
+                                         "event_type": event_type, **metrics})
     result = ExperimentResult(predictions, aggregate, per_basin, routing, traces, extremes,
                               failures, resolved, parameter_count, time.perf_counter()-started,
                               _cancelled(cancellation_token))
+    if config.forecast.mode == "rolling":
+        for lead in sorted({item.lead_day for item in predictions}):
+            rows = [item for item in predictions if item.lead_day == lead]
+            prediction = torch.tensor([item.predicted_mm_day for item in rows])
+            observation = torch.tensor([item.observed_mm_day for item in rows])
+            nse, kge, rmse = _metrics(prediction, observation)
+            result.forecast_metrics[str(lead)] = {
+                "samples": len(rows), "nse": nse, "kge": kge, "rmse_mm_day": rmse,
+            }
     return result
 
 
@@ -1218,13 +1401,19 @@ def write_result_artifacts(result: ExperimentResult, directory: str | Path | Non
     root = Path(directory or tempfile.mkdtemp(prefix="regional-hydrology-")); root.mkdir(parents=True, exist_ok=True)
     predictions_path, metrics_path, config_path = root/"predictions.csv", root/"metrics.csv", root/"config.json"
     with predictions_path.open("w", newline="", encoding="utf-8") as target:
-        writer = csv.DictWriter(target, fieldnames=("seed","basin_id","target_date","observed_mm_day","predicted_mm_day","complex_weight","physics_error","ood_score","ood_threshold")); writer.writeheader()
+        writer = csv.DictWriter(target, fieldnames=("seed","basin_id","target_date","observed_mm_day","predicted_mm_day","complex_weight","physics_error","ood_score","ood_threshold","issue_date","lead_day")); writer.writeheader()
         for item in result.predictions:
-            row = asdict(item); row["target_date"] = item.target_date.isoformat(); writer.writerow(row)
+            row = asdict(item); row["target_date"] = item.target_date.isoformat()
+            row["issue_date"] = item.issue_date.isoformat() if item.issue_date else ""
+            writer.writerow(row)
     with metrics_path.open("w", newline="", encoding="utf-8") as target:
         writer = csv.DictWriter(target, fieldnames=("scope","basin_id","nse","kge","rmse_mm_day","physics_error")); writer.writeheader()
         writer.writerow({"scope":"aggregate","basin_id":"all",**result.aggregate_metrics})
         for basin, values in result.per_basin_metrics.items(): writer.writerow({"scope":"basin","basin_id":basin,**values})
+        for lead, values in result.forecast_metrics.items():
+            writer.writerow({"scope":f"lead_{lead}", "basin_id":"all",
+                             "nse":values["nse"], "kge":values["kge"],
+                             "rmse_mm_day":values["rmse_mm_day"]})
     config_path.write_text(json.dumps(result.resolved_config, indent=2, allow_nan=False), encoding="utf-8")
     archive = root/"regional_experiment.zip"
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
@@ -1246,7 +1435,7 @@ PooledHydrologySplit = RegionalSplit
 
 __all__ = ["BasinCatalogRecord", "BasinScopeConfig", "CAMELSCHCatalog", "CancellationToken",
            "DateRange", "DateSplitConfig", "ExperimentConfig", "ExperimentResult",
-           "ExtremeEventConfig", "HyperparameterConfig", "ModelArchitectureConfig",
+           "ExtremeEventConfig", "ForecastConfig", "HyperparameterConfig", "ModelArchitectureConfig",
            "PhysicsModelConfig", "PredictionRecord", "RegionalExperimentConfig",
            "RegionalHydrologyData", "RegionalSplit", "TrainingStrategyConfig",
            "DateRangesConfig", "PooledHydrologyData", "PooledHydrologySplit",

@@ -11,7 +11,7 @@ from typing import Mapping, TypeVar
 from .camels_ch_chem import DEFAULT_CAMELS_CH_CHEM_FEATURES
 from .estreams import ESTREAMS_DYNAMIC_FEATURES
 from .regional import (
-    BasinScopeConfig, DateRange, DateSplitConfig, ExtremeEventConfig,
+    BasinScopeConfig, DateRange, DateSplitConfig, ExtremeEventConfig, ForecastConfig,
     HyperparameterConfig, ModelArchitectureConfig, PhysicsModelConfig,
     RegionalExperimentConfig, TrainingStrategyConfig, run_regional_experiment,
 )
@@ -25,7 +25,7 @@ def _dataclass_values(cls: type[T], value: Mapping[str, object]) -> dict[str, ob
     allowed = {item.name for item in fields(cls)}
     result = {key: item for key, item in value.items() if key in allowed}
     for key in (
-        "mlp_widths", "seeds", "robustness_noise_levels",
+        "mlp_widths", "seeds", "robustness_noise_levels", "event_types",
     ):
         if key in result and isinstance(result[key], list):
             result[key] = tuple(result[key])  # type: ignore[index]
@@ -96,6 +96,7 @@ def config_from_mapping(
             if isinstance(chem_features, (list, tuple))
             else DEFAULT_CAMELS_CH_CHEM_FEATURES
         ),
+        forecast=ForecastConfig(**_dataclass_values(ForecastConfig, section("forecast"))),
     )
 
 
