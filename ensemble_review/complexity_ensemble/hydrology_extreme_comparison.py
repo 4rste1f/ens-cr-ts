@@ -22,9 +22,15 @@ from .hydrology_distillation import train_hydrology_distill_to_simple
 from .hydrology_hard_routing_consolidation_comparison import (
     train_hydrology_model_with_hard_routing_and_consolidation,
 )
+from .hydrology_comparison import _add_observation_noise
+from .ood import MahalanobisOODDetector
+from .stacking import fit_convex_stacking_weight
 
 
 ENSEMBLE_APPROACHES = ("soft_routing", "hard_routing", "distillation")
+AVAILABLE_APPROACHES = (
+    *ENSEMBLE_APPROACHES, "no_routing", "static_50_50", "ood_fallback", "stacking",
+)
 SUPPORTED_ROUTERS = ("morse", "learned")
 
 
@@ -45,17 +51,20 @@ class ExtremeComparisonConfig:
     batch_size: int = 64
     learning_rate: float = 1e-3
     training_noise: float = 0.0
+    inference_noise: float = 0.0
     consolidation_weight: float = 0.05
     complexity_percentile: float = 80.0
     gate_temperature: float = 0.15
     hard_inference: bool = False
     include_baselines: bool = True
+    ood_quantile: float = 0.99
+    ood_shrinkage: float = 0.1
 
     def validate(self) -> None:
-        unknown = set(self.approaches) - set(ENSEMBLE_APPROACHES)
+        unknown = set(self.approaches) - set(AVAILABLE_APPROACHES)
         if not self.approaches or unknown:
             raise ValueError(
-                "approaches must contain only: " + ", ".join(ENSEMBLE_APPROACHES)
+                "approaches must contain only: " + ", ".join(AVAILABLE_APPROACHES)
             )
         if self.routing not in SUPPORTED_ROUTERS:
             raise ValueError("routing must be 'morse' or 'learned'")
@@ -77,12 +86,20 @@ class ExtremeComparisonConfig:
         )
         if min(epoch_counts) < 1 or self.batch_size < 1 or self.learning_rate <= 0.0:
             raise ValueError("epoch counts, batch_size, and learning_rate must be positive")
-        if self.training_noise < 0.0 or self.consolidation_weight < 0.0:
+        if (
+            self.training_noise < 0.0
+            or self.inference_noise < 0.0
+            or self.consolidation_weight < 0.0
+        ):
             raise ValueError("noise and consolidation weight must be non-negative")
         if not 0.0 < self.complexity_percentile < 100.0:
             raise ValueError("complexity_percentile must be strictly between zero and 100")
         if self.gate_temperature <= 0.0:
             raise ValueError("gate_temperature must be positive")
+        if not 0.0 < self.ood_quantile < 1.0:
+            raise ValueError("ood_quantile must be strictly between zero and one")
+        if not 0.0 <= self.ood_shrinkage <= 1.0:
+            raise ValueError("ood_shrinkage must be between zero and one")
 
 
 @dataclass(frozen=True)
@@ -95,6 +112,7 @@ class ExtremeEnsembleRecord:
     simple_expert: str
     complex_expert: str
     seed: int
+    inference_noise: float
     threshold_quantile: float
     threshold_mm_day: float
     test_days: int
@@ -118,6 +136,10 @@ class ExtremeEnsembleRecord:
     parameters: int
     training_seconds: float
     simple_training_fraction: float
+    mean_ood_score: float
+    ood_fraction: float
+    ood_threshold: float
+    stacking_validation_mse_mm2_day2: float
 
 
 def _safe_ratio(numerator: int | float, denominator: int | float) -> float:
@@ -262,6 +284,130 @@ def _new_model(data: HydrologyData, config: ExtremeComparisonConfig) -> RoutedHy
     )
 
 
+def _train_independent_experts(
+    model: RoutedHydrologyModel,
+    data: HydrologyData,
+    config: ExtremeComparisonConfig,
+    approach: str,
+    seed: int,
+    device: torch.device,
+    verbose: bool,
+) -> None:
+    inputs = data.train.inputs.to(device)
+    physical = data.train.physical_inputs.to(device)
+    targets = data.train.targets.to(device)
+    parameters = [*model.complex_expert.parameters(), model.raw_response, model.raw_recession]
+    if approach != "no_routing":
+        parameters.extend(model.simple_expert.parameters())
+    optimizer = torch.optim.Adam(parameters, lr=config.learning_rate)
+    generator = torch.Generator(device=device).manual_seed(seed + 104729)
+    for epoch in range(config.epochs):
+        total = 0.0
+        permutation = torch.randperm(len(inputs), generator=generator, device=device)
+        for start in range(0, len(inputs), config.batch_size):
+            indices = permutation[start:start + config.batch_size]
+            noisy = _add_observation_noise(
+                inputs[indices], data.feature_names, config.training_noise, generator
+            )
+            optimizer.zero_grad()
+            complex_prediction = model._positive_discharge(model.complex_expert(noisy))
+            complex_loss = (
+                (complex_prediction.squeeze(-1) - targets[indices]).square().mean()
+                + 0.05 * model.physics_residual(
+                    complex_prediction, physical[indices]
+                ).square().mean()
+            )
+            if approach == "no_routing":
+                loss = complex_loss
+            else:
+                simple_prediction = model._positive_discharge(model.simple_expert(noisy))
+                simple_loss = (
+                    (simple_prediction.squeeze(-1) - targets[indices]).square().mean()
+                    + 0.05 * model.physics_residual(
+                        simple_prediction, physical[indices]
+                    ).square().mean()
+                )
+                loss = 0.5 * (simple_loss + complex_loss)
+            loss.backward()
+            optimizer.step()
+            total += float(loss.detach()) * len(indices)
+        if verbose:
+            print(
+                f"  {approach} epoch {epoch + 1}/{config.epochs}: "
+                f"loss={total / len(inputs):.6f}",
+                flush=True,
+            )
+
+
+@torch.no_grad()
+def _predict_independent_approach(
+    model: RoutedHydrologyModel,
+    data: HydrologyData,
+    config: ExtremeComparisonConfig,
+    approach: str,
+    seed: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, float, float, float, float, float]:
+    model.eval()
+    inputs = data.test.inputs.to(device)
+    if config.inference_noise:
+        generator = torch.Generator(device=device).manual_seed(seed + 300007)
+        inputs = _add_observation_noise(
+            inputs, data.feature_names, config.inference_noise, generator
+        )
+    complex_prediction = model._positive_discharge(model.complex_expert(inputs))
+    mean_ood_score = ood_fraction = ood_threshold = float("nan")
+    stacking_validation_mse = float("nan")
+    if approach == "no_routing":
+        prediction = complex_prediction
+        weight = torch.ones(len(inputs), device=device)
+    else:
+        simple_prediction = model._positive_discharge(model.simple_expert(inputs))
+        if approach == "static_50_50":
+            weight = torch.full((len(inputs),), 0.5, device=device)
+        elif approach == "stacking":
+            validation_inputs = data.validation.inputs.to(device)
+            if config.inference_noise:
+                generator = torch.Generator(device=device).manual_seed(seed + 200003)
+                validation_inputs = _add_observation_noise(
+                    validation_inputs,
+                    data.feature_names,
+                    config.inference_noise,
+                    generator,
+                )
+            validation_simple = model._positive_discharge(
+                model.simple_expert(validation_inputs)
+            )
+            validation_complex = model._positive_discharge(
+                model.complex_expert(validation_inputs)
+            )
+            fitted_weight, normalized_mse = fit_convex_stacking_weight(
+                validation_simple, validation_complex, data.validation.targets.to(device)
+            )
+            weight = torch.full((len(inputs),), fitted_weight, device=device)
+            stacking_validation_mse = normalized_mse * float(data.discharge_scale.square())
+        else:
+            detector = MahalanobisOODDetector(
+                config.ood_quantile, config.ood_shrinkage
+            ).fit(data.train.inputs.to(device))
+            scores = detector.score(inputs)
+            flags = detector.is_ood(inputs)
+            weight = (~flags).to(inputs.dtype)
+            mean_ood_score = float(scores.mean().cpu())
+            ood_fraction = float(flags.float().mean().cpu())
+            assert detector.threshold is not None
+            ood_threshold = float(detector.threshold.cpu())
+        prediction = torch.lerp(simple_prediction, complex_prediction, weight[:, None])
+    return (
+        prediction.squeeze(-1).cpu() * data.discharge_scale.cpu(),
+        float(weight.mean().cpu()),
+        mean_ood_score,
+        ood_fraction,
+        ood_threshold,
+        stacking_validation_mse,
+    )
+
+
 @torch.no_grad()
 def _predict(
     model: RoutedHydrologyModel,
@@ -270,9 +416,18 @@ def _predict(
     device: torch.device,
     *,
     hard: bool,
+    feature_names: tuple[str, ...],
+    inference_noise: float,
+    seed: int,
 ) -> tuple[torch.Tensor, float]:
     model.eval()
-    output = model(split.inputs.to(device), hard=hard, return_details=True)
+    inputs = split.inputs.to(device)
+    if inference_noise:
+        generator = torch.Generator(device=device).manual_seed(seed + 300007)
+        inputs = _add_observation_noise(
+            inputs, feature_names, inference_noise, generator
+        )
+    output = model(inputs, hard=hard, return_details=True)
     assert isinstance(output, HydrologyRoutedOutput)
     prediction = output.discharge.squeeze(-1).cpu() * discharge_scale.cpu()
     return prediction, float(output.complex_weight.mean())
@@ -308,6 +463,10 @@ def _record(
     parameters: int,
     training_seconds: float,
     simple_training_fraction: float,
+    mean_ood_score: float = float("nan"),
+    ood_fraction: float = float("nan"),
+    ood_threshold: float = float("nan"),
+    stacking_validation_mse_mm2_day2: float = float("nan"),
 ) -> ExtremeEnsembleRecord:
     target = data.test.targets.cpu() * data.discharge_scale.cpu()
     metrics = extreme_metrics(prediction, target, data.test.target_dates, threshold)
@@ -315,11 +474,20 @@ def _record(
         data.country,
         data.basin_id,
         approach,
-        config.routing if approach not in {"persistence", "seasonal_climatology"} else "none",
+        ({
+            "no_routing": "none",
+            "static_50_50": "fixed",
+            "ood_fallback": "mahalanobis",
+            "stacking": "validation_weighted",
+        }.get(approach, config.routing)
+         if approach not in {"persistence", "seasonal_climatology"} else "none"),
         inference_routing,
-        config.simple_kind if approach not in {"persistence", "seasonal_climatology"} else "none",
+        (config.simple_kind
+         if approach not in {"persistence", "seasonal_climatology", "no_routing"}
+         else "none"),
         config.complex_kind if approach not in {"persistence", "seasonal_climatology"} else "none",
         seed,
+        config.inference_noise,
         config.threshold_quantile,
         threshold,
         **metrics,
@@ -327,6 +495,10 @@ def _record(
         parameters=parameters,
         training_seconds=training_seconds,
         simple_training_fraction=simple_training_fraction,
+        mean_ood_score=mean_ood_score,
+        ood_fraction=ood_fraction,
+        ood_threshold=ood_threshold,
+        stacking_validation_mse_mm2_day2=stacking_validation_mse_mm2_day2,
     )
 
 
@@ -372,6 +544,8 @@ def compare_extreme_event_ensembles(
             model = _new_model(data, config).to(device)
             started = time.perf_counter()
             simple_fraction = float("nan")
+            mean_ood_score = ood_fraction = ood_threshold = float("nan")
+            stacking_validation_mse = float("nan")
             if approach == "soft_routing":
                 train_hydrology_model_with_consolidation(
                     model,
@@ -400,7 +574,7 @@ def compare_extreme_event_ensembles(
                     feature_names=data.feature_names,
                     verbose=verbose,
                 )
-            else:
+            elif approach == "distillation":
                 report = train_hydrology_distill_to_simple(
                     model,
                     data.train,
@@ -417,15 +591,53 @@ def compare_extreme_event_ensembles(
                     verbose=verbose,
                 )
                 simple_fraction = report.simple_fraction
+            else:
+                _train_independent_experts(
+                    model, data, config, approach, seed, device, verbose
+                )
+                simple_fraction = 0.0 if approach == "no_routing" else 1.0
             elapsed = time.perf_counter() - started
-            hard_inference = approach == "hard_routing" and config.hard_inference
-            prediction, mean_weight = _predict(
-                model,
-                data.test,
-                data.discharge_scale,
-                device,
-                hard=hard_inference,
-            )
+            if approach in {"no_routing", "static_50_50", "ood_fallback", "stacking"}:
+                (
+                    prediction,
+                    mean_weight,
+                    mean_ood_score,
+                    ood_fraction,
+                    ood_threshold,
+                    stacking_validation_mse,
+                ) = (
+                    _predict_independent_approach(
+                        model, data, config, approach, seed, device
+                    )
+                )
+                inference_routing = {
+                    "no_routing": "none",
+                    "static_50_50": "fixed_50_50",
+                    "ood_fallback": "ood_hard_fallback",
+                    "stacking": "validation_weighted",
+                }[approach]
+            else:
+                hard_inference = approach == "hard_routing" and config.hard_inference
+                prediction, mean_weight = _predict(
+                    model,
+                    data.test,
+                    data.discharge_scale,
+                    device,
+                    hard=hard_inference,
+                    feature_names=data.feature_names,
+                    inference_noise=config.inference_noise,
+                    seed=seed,
+                )
+                inference_routing = "hard" if hard_inference else "soft"
+            if approach in {"no_routing", "static_50_50", "ood_fallback", "stacking"}:
+                active_parameters = [
+                    *model.complex_expert.parameters(), model.raw_response, model.raw_recession
+                ]
+                if approach != "no_routing":
+                    active_parameters.extend(model.simple_expert.parameters())
+                parameters = sum(parameter.numel() for parameter in active_parameters)
+            else:
+                parameters = sum(parameter.numel() for parameter in model.parameters())
             records.append(
                 _record(
                     data,
@@ -434,11 +646,15 @@ def compare_extreme_event_ensembles(
                     seed=seed,
                     threshold=threshold,
                     prediction=prediction,
-                    inference_routing="hard" if hard_inference else "soft",
+                    inference_routing=inference_routing,
                     mean_complex_weight=mean_weight,
-                    parameters=sum(parameter.numel() for parameter in model.parameters()),
+                    parameters=parameters,
                     training_seconds=elapsed,
                     simple_training_fraction=simple_fraction,
+                    mean_ood_score=mean_ood_score,
+                    ood_fraction=ood_fraction,
+                    ood_threshold=ood_threshold,
+                    stacking_validation_mse_mm2_day2=stacking_validation_mse,
                 )
             )
     return records
@@ -478,6 +694,7 @@ def format_extreme_ensemble_summary(records: list[ExtremeEnsembleRecord]) -> str
 
 
 __all__ = [
+    "AVAILABLE_APPROACHES",
     "ENSEMBLE_APPROACHES",
     "ExtremeComparisonConfig",
     "ExtremeEnsembleRecord",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -70,6 +71,24 @@ class ExtremeComparisonTests(unittest.TestCase):
         self.assertTrue(all(record.parameters > 0 for record in records))
         self.assertTrue(0.0 < records[-1].simple_training_fraction < 1.0)
 
+    def test_independent_baseline_approaches_are_selectable(self) -> None:
+        config = ExtremeComparisonConfig(
+            approaches=("no_routing", "static_50_50", "ood_fallback", "stacking"),
+            seeds=(0,), complex_kind="mlp", epochs=1, batch_size=256,
+            include_baselines=False, inference_noise=0.2,
+        )
+        records = compare_extreme_event_ensembles(self.data, config)
+        self.assertEqual(
+            [record.approach for record in records],
+            ["no_routing", "static_50_50", "ood_fallback", "stacking"],
+        )
+        self.assertEqual(records[0].mean_complex_weight, 1.0)
+        self.assertEqual(records[1].mean_complex_weight, 0.5)
+        self.assertTrue(math.isfinite(records[2].ood_threshold))
+        self.assertTrue(0.0 <= records[3].mean_complex_weight <= 1.0)
+        self.assertTrue(math.isfinite(records[3].stacking_validation_mse_mm2_day2))
+        self.assertTrue(all(record.inference_noise == 0.2 for record in records))
+
     def test_approaches_are_independently_selectable(self) -> None:
         config = ExtremeComparisonConfig(
             approaches=("hard_routing",),
@@ -119,14 +138,23 @@ class ExtremeComparisonTests(unittest.TestCase):
     def test_cli_accepts_an_explicit_comparison(self) -> None:
         args = build_parser().parse_args(
             [
-                "--approaches", "soft_routing,distillation",
+                "--approaches", "no_routing,static_50_50,ood_fallback,stacking",
                 "--simple", "fourier",
                 "--complex", "pinnmamba",
                 "--seeds", "0,42",
+                "--inference-noise", "0.25",
             ]
         )
-        self.assertEqual(args.approaches, ("soft_routing", "distillation"))
+        self.assertEqual(
+            args.approaches,
+            ("no_routing", "static_50_50", "ood_fallback", "stacking"),
+        )
         self.assertEqual(args.seeds, (0, 42))
+        self.assertEqual(args.inference_noise, 0.25)
+
+    def test_negative_inference_noise_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "noise"):
+            ExtremeComparisonConfig(inference_noise=-0.1).validate()
 
 
 if __name__ == "__main__":

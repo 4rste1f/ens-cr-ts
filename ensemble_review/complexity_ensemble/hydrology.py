@@ -81,10 +81,16 @@ class HydrologyPINNMambaExpert(nn.Module):
         num_layers: int = 1,
         hidden_d_ff: int = 64,
         heads: int = 2,
+        static_dim: int = 0,
+        static_embedding_dim: int = 8,
     ) -> None:
         super().__init__()
+        self.static_embedding = (
+            nn.Sequential(nn.Linear(static_dim, static_embedding_dim), nn.Tanh())
+            if static_dim else None
+        )
         self.model = PINNMamba(
-            in_dim=feature_count,
+            in_dim=feature_count + (static_embedding_dim if static_dim else 0),
             out_dim=1,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
@@ -92,7 +98,14 @@ class HydrologyPINNMambaExpert(nn.Module):
             heads=heads,
         )
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, static_inputs: torch.Tensor | None = None) -> torch.Tensor:
+        if self.static_embedding is not None:
+            if static_inputs is None:
+                raise ValueError("static_inputs are required by this regional expert")
+            context = self.static_embedding(static_inputs)[:, None, :].expand(
+                -1, inputs.shape[1], -1
+            )
+            inputs = torch.cat((inputs, context), dim=-1)
         return self.model(inputs)[:, -1]
 
 
@@ -175,12 +188,18 @@ class LearnedHydrologyMorseRouter(MorseRouter):
 
 
 class _FlattenedExpert(nn.Module):
-    def __init__(self, expert: nn.Module) -> None:
+    def __init__(self, expert: nn.Module, static_dim: int = 0) -> None:
         super().__init__()
         self.expert = expert
+        self.static_dim = static_dim
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.expert(inputs.flatten(start_dim=1))
+    def forward(self, inputs: torch.Tensor, static_inputs: torch.Tensor | None = None) -> torch.Tensor:
+        flattened = inputs.flatten(start_dim=1)
+        if self.static_dim:
+            if static_inputs is None:
+                raise ValueError("static_inputs are required by this regional expert")
+            flattened = torch.cat((flattened, static_inputs), dim=-1)
+        return self.expert(flattened)
 
 
 def build_hydrology_complex_expert(
@@ -188,13 +207,16 @@ def build_hydrology_complex_expert(
     sequence_length: int,
     feature_count: int,
     kwargs: dict[str, object] | None = None,
+    static_dim: int = 0,
 ) -> nn.Module:
     kwargs = dict(kwargs or {})
     if kind == "mlp":
         kwargs.setdefault("hidden_dims", (64, 64))
-        return _FlattenedExpert(MLPExpert(sequence_length * feature_count, 1, **kwargs))
+        return _FlattenedExpert(
+            MLPExpert(sequence_length * feature_count + static_dim, 1, **kwargs), static_dim
+        )
     if kind == "pinnmamba":
-        return HydrologyPINNMambaExpert(feature_count, **kwargs)
+        return HydrologyPINNMambaExpert(feature_count, static_dim=static_dim, **kwargs)
     raise ValueError("complex_kind must be 'mlp' or 'pinnmamba'")
 
 
@@ -205,6 +227,13 @@ class _HydrologyModelBase(nn.Module):
         self.register_buffer("discharge_scale", torch.as_tensor(discharge_scale).reshape(()).float())
         self.raw_response = nn.Parameter(torch.tensor(0.0))
         self.raw_recession = nn.Parameter(torch.tensor(-2.0))
+        self.physics_correction: nn.Module | None = None
+
+    def set_physics_correction(self, correction: nn.Module | None) -> None:
+        """Attach a frozen, data-derived correction to the reservoir balance."""
+        self.physics_correction = correction
+        if correction is not None:
+            correction.requires_grad_(False)
 
     def _positive_discharge(self, raw: torch.Tensor) -> torch.Tensor:
         return F.softplus(raw)
@@ -219,6 +248,8 @@ class _HydrologyModelBase(nn.Module):
         response, recession = self.reservoir_parameters()
         effective_precipitation = F.relu(precipitation - pet)
         expected_change = response * effective_precipitation - recession * previous_flow
+        if self.physics_correction is not None:
+            expected_change = expected_change + self.physics_correction(physical_inputs)
         predicted_flow = prediction.squeeze(-1) * self.discharge_scale
         return (predicted_flow - previous_flow - expected_change) / self.discharge_scale
 
@@ -240,22 +271,26 @@ class RoutedHydrologyModel(_HydrologyModelBase):
         simple_kwargs: dict[str, object] | None = None,
         complex_kwargs: dict[str, object] | None = None,
         learned_morse_potential: LearnedHydrologyMorsePotential | None = None,
+        static_dim: int = 0,
     ) -> None:
         super().__init__(discharge_scale, feature_names)
         feature_count = len(feature_names)
         flat_dim = sequence_length * feature_count
+        expert_dim = flat_dim + static_dim
         simple_kwargs = dict(simple_kwargs or {})
         if simple_kind == "rbf":
             simple_kwargs.setdefault("n_centers", 32)
-            simple_kwargs.setdefault("domain_low", [-2.0] * flat_dim)
-            simple_kwargs.setdefault("domain_high", [2.0] * flat_dim)
-            simple_kwargs.setdefault("initial_width", math.sqrt(flat_dim))
+            simple_kwargs.setdefault("domain_low", [-2.0] * expert_dim)
+            simple_kwargs.setdefault("domain_high", [2.0] * expert_dim)
+            simple_kwargs.setdefault("initial_width", math.sqrt(expert_dim))
         elif simple_kind == "fourier":
             simple_kwargs.setdefault("n_frequencies", 32)
-            simple_kwargs.setdefault("frequency_scale", 1.0 / math.sqrt(flat_dim))
-        self.simple_expert = _FlattenedExpert(build_expert(simple_kind, flat_dim, 1, **simple_kwargs))
+            simple_kwargs.setdefault("frequency_scale", 1.0 / math.sqrt(expert_dim))
+        self.simple_expert = _FlattenedExpert(
+            build_expert(simple_kind, expert_dim, 1, **simple_kwargs), static_dim
+        )
         self.complex_expert = build_hydrology_complex_expert(
-            complex_kind, sequence_length, feature_count, complex_kwargs
+            complex_kind, sequence_length, feature_count, complex_kwargs, static_dim
         )
         if routing == "morse":
             gradient = partial(
@@ -289,6 +324,7 @@ class RoutedHydrologyModel(_HydrologyModelBase):
         self.simple_kind = simple_kind
         self.complex_kind = complex_kind
         self.routing_kind = routing
+        self.static_dim = static_dim
 
     def _router_features(
         self,
@@ -316,11 +352,12 @@ class RoutedHydrologyModel(_HydrologyModelBase):
         routing_features: torch.Tensor | None = None,
         hard: bool = False,
         return_details: bool = False,
+        static_inputs: torch.Tensor | None = None,
     ) -> torch.Tensor | HydrologyRoutedOutput:
         router_features = self._router_features(inputs, routing_features)
         weight = self.router.complex_weight(router_features, hard=hard)
-        simple = self.simple_expert(inputs)
-        complex_value = self.complex_expert(inputs)
+        simple = self.simple_expert(inputs, static_inputs)
+        complex_value = self.complex_expert(inputs, static_inputs)
         discharge = self._positive_discharge(torch.lerp(simple, complex_value, weight[:, None]))
         if return_details:
             return HydrologyRoutedOutput(discharge, weight, simple, complex_value)
@@ -337,8 +374,12 @@ class RoutedHydrologyModel(_HydrologyModelBase):
         interface_weight: float = 0.05,
         routing_weight: float = 0.05,
         compute_weight: float = 0.0,
+        static_inputs: torch.Tensor | None = None,
     ) -> HydrologyLosses:
-        routed = self(inputs, routing_features=routing_features, return_details=True)
+        routed = self(
+            inputs, routing_features=routing_features, return_details=True,
+            static_inputs=static_inputs,
+        )
         assert isinstance(routed, HydrologyRoutedOutput)
         data = (routed.discharge.squeeze(-1) - targets).square().mean()
         physics = self.physics_residual(routed.discharge, physical_inputs).square().mean()

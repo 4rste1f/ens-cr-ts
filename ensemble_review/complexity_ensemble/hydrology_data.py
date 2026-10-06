@@ -135,8 +135,11 @@ def load_camels_ch(
     if not observed_path.exists() or not simulated_path.exists():
         raise FileNotFoundError(f"CAMELS-CH basin {basin_id} was not found under {root}")
 
+    # Key by parsed date rather than raw text.  Some CAMELS-CH releases use
+    # different but equivalent date formatting in the observation and
+    # simulation exports.
     observed = {
-        row["date"]: _finite_float(row, "discharge_spec(mm/d)")
+        _parse_date(row["date"]): _finite_float(row, "discharge_spec(mm/d)")
         for row in _read_rows(observed_path)
     }
     landcover = _load_landcover(root, basin_id) if include_landcover else {}
@@ -150,7 +153,7 @@ def load_camels_ch(
         day = _parse_date(row["date"])
         if (start_date and day < start_date) or (end_date and day > end_date):
             continue
-        discharge = observed.get(row["date"])
+        discharge = observed.get(day)
         values = [
             _finite_float(row, "precipitation_sim(mm/d)"),
             _finite_float(row, "temperature_sim(degC)"),
