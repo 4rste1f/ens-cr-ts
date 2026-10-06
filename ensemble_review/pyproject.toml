@@ -16,6 +16,11 @@ complexity-ensemble-run = "complexity_ensemble.regional_cli:main"
 [tool.setuptools.package-data]
 complexity_ensemble = ["design/*.css"]
 
+[tool.setuptools.packages.find]
+include = ["complexity_ensemble*"]
+
 [project.optional-dependencies]
+animations = ["Pillow"]
 tda = ["ripser>=0.6"]
 kan = ["pykan>=0.2.8"]
+dev = ["pytest"]

@@ -6,7 +6,7 @@ import argparse
 import html
 import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +19,9 @@ from .design.config_help import config_info
 from .design.dataset_help import dataset_info
 from .estreams import ESTREAMS_DYNAMIC_FEATURES, EStreamsVegetationSnow
 from .paved_scenario import PavedSiteConfig, run_paved_site_scenario
+from .rainfall_replay import (
+    event_choices, export_gif, forecast_snapshot, make_replay, replay_figures,
+)
 from .regional import (
     BasinScopeConfig, CAMELSCHCatalog, CancellationToken, DateRange, DateSplitConfig,
     ExtremeEventConfig, ForecastConfig, HyperparameterConfig, ModelArchitectureConfig,
@@ -524,6 +527,34 @@ def build_app(
             )
             validate_camels_chem = gr.Button("Validate CAMELS-CH-Chem path")
             camels_chem_status = gr.Markdown()
+        with gr.Tab("Rainfall–runoff replay"):
+            gr.Markdown(
+                "## Follow a CAMELS-CH rainfall episode to a discharge prediction\n"
+                "Run an experiment, then choose a target basin. The charts replay CAMELS-CH "
+                "daily simulation-based precipitation and potential evapotranspiration (PET), "
+                "observed gauge flow, and the mean prediction across seeds. The fourth view "
+                "shows the dated input window and next-day target. The third view is a "
+                "separate, uncalibrated teaching bucket: rain enters storage, evaporation "
+                "is limited by PET and available water, and 30% of the remainder is "
+                "released each day. It is not the trained model's internal state."
+            )
+            with gr.Row():
+                replay_basin = gr.Dropdown(choices=choices, label="Prediction target basin")
+                replay_episode = gr.Dropdown(label="Rainfall episode")
+            replay_find = gr.Button("Find rainfall episodes")
+            replay_show = gr.Button("Show replay", variant="primary")
+            replay_status = gr.Markdown("Run an experiment to load a replay.")
+            replay_inputs = gr.Markdown()
+            replay_day = gr.Slider(minimum=1, maximum=14, step=1, value=1,
+                                   label="Predicted day (1–14)", interactive=False)
+            replay_weather = gr.Plot(label="1 · Historical weather")
+            replay_discharge = gr.Plot(label="2 · Discharge at the gauge")
+            replay_bucket = gr.Plot(label="3 · Teaching bucket")
+            replay_scene = gr.HTML(label="4 · Inputs to prediction")
+            replay_download = gr.Button("Generate GIF")
+            replay_preview = gr.Image(label="GIF preview", interactive=False)
+            replay_gif = gr.File(label="Replay GIF")
+            replay_state = gr.State(None)
         with gr.Tab("Training hyperparameters"):
             with gr.Row():
                 sequence=gr.Number(30,precision=0,label="Sequence length"); seeds=gr.Textbox("0",label="Seeds")
@@ -748,6 +779,10 @@ predictors; discharge remains the prediction target.
 Run results include basin maps, observed-versus-predicted discharge plots,
 expert usage, loss traces, discharge metrics, and optional hydrological event
 scores. One-day forecasts can be compared with rolling multi-day hindcasts.
+The Rainfall–runoff replay tab steps through a test-period rainfall episode,
+its weather inputs, and predicted versus observed gauge discharge. A dated
+diagram shows the preceding input window and next-day prediction. The teaching
+bucket is a separate, uncalibrated water-balance illustration.
 The Results tab also offers a user-defined daily paved-site and retention
 scenario, with baseline and scenario discharge and fixed-threshold event counts.
 You can export predictions,
@@ -952,6 +987,121 @@ the leaderboard lets you revisit and compare saved runs.
                      basin_chart, loss_comparison],
         )
 
+        def find_replay_episodes(result, basin):
+            if result is None or not result.predictions:
+                raise gr.Error("Run an experiment before opening the rainfall replay")
+            targets_in_run = result.resolved_config["basins"]["target_basins"]
+            if str(basin) not in targets_in_run:
+                raise gr.Error("Select a prediction target from the current run")
+            rows = [row for row in result.predictions if row.basin_id == str(basin)]
+            sequence_length = int(result.resolved_config.get("hyperparameters", {}).get(
+                "sequence_length", 30))
+            start = min(row.target_date for row in rows) - timedelta(days=sequence_length + 7)
+            end = max(row.target_date for row in rows) + timedelta(days=14)
+            try:
+                series = catalog.load_series(str(basin), start, end)
+                episodes = event_choices(series, rows, context_days=sequence_length)
+            except (OSError, ValueError) as error:
+                raise gr.Error(str(error)) from error
+            if not episodes:
+                raise gr.Error("No complete rainfall episode with predictions was found")
+            return gr.Dropdown(choices=episodes, value=episodes[0][1]), (
+                f"Found {len(episodes)} rainfall episodes in the test period."
+            )
+
+        def show_replay(result, basin, episode):
+            if result is None or not episode:
+                raise gr.Error("Run an experiment and choose a rainfall episode")
+            rows = [row for row in result.predictions if row.basin_id == str(basin)]
+            if not rows or str(basin) not in result.resolved_config["basins"]["target_basins"]:
+                raise gr.Error("Select a prediction target from the current run")
+            context = int(result.resolved_config.get("hyperparameters", {}).get(
+                "sequence_length", 30))
+            feature_names = result.resolved_config.get("feature_names", [])
+            static_names = result.resolved_config.get("static_feature_names", [])
+            extras = [name for name in feature_names if name not in {
+                "precipitation", "temperature", "pet", "previous_discharge", "day_sin", "day_cos"
+            }]
+            forecast_mode = result.resolved_config.get("forecast", {}).get("mode", "one_day")
+            first = date.fromisoformat(str(episode))
+            try:
+                series = catalog.load_series(str(basin), first - timedelta(days=context),
+                                             first + timedelta(days=13))
+                replay = make_replay(
+                    series, rows, first, context_days=context,
+                    extra_features=tuple(extras), static_feature_count=len(static_names),
+                    forecast_mode=forecast_mode,
+                )
+            except (OSError, ValueError) as error:
+                raise gr.Error(str(error)) from error
+            details = (
+                f"**Input:** {context} preceding days of precipitation, temperature, PET, "
+                "previous discharge and seasonal day encoding. In rolling mode, model "
+                "predictions replace previous discharge after the issue date. "
+                f"**Additional selected predictors:** {', '.join(extras) if extras else 'none'}. "
+                f"**Static basin descriptors:** {len(static_names)}. "
+                "**Target:** next-day gauge discharge (mm/day). "
+                "PET is potential evaporation demand, not measured actual evaporation. "
+                "The third chart's evaporation and release come from a separate "
+                "uncalibrated teaching bucket, not the trained model."
+            )
+            figures = replay_figures(replay, 1)
+            return (replay, gr.Slider(maximum=len(replay.dates) - context, value=1,
+                                      interactive=True), *figures, details,
+                    replay_day_summary(replay, 1), None, None)
+
+        def replay_day_summary(replay, day_number):
+            i = replay.context_days + day_number - 1
+            snapshot = forecast_snapshot(replay, day_number)
+            return (
+                f"**{replay.dates[i].isoformat()} · day {day_number} of "
+                f"{len(replay.dates) - replay.context_days}** — "
+                f"preceding-window rainfall {snapshot['rain_total']:.1f} mm; "
+                f"PET {snapshot['pet_total']:.1f} mm; "
+                f"observed discharge {replay.observed[i]:.1f} mm/day; "
+                f"predicted discharge {replay.predicted[i]:.1f} mm/day. "
+                "The third chart shows a separate teaching bucket for this day."
+            )
+
+        def select_replay_day(replay, day_number):
+            if replay is None:
+                raise gr.Error("Show a replay before selecting a day")
+            day_number = int(day_number)
+            figures = replay_figures(replay, day_number)
+            return (*figures, replay_day_summary(replay, day_number))
+
+        def download_replay_gif(replay):
+            if replay is None:
+                raise gr.Error("Show a replay before downloading a GIF")
+            try:
+                path = str(export_gif(replay))
+                return path, path
+            except (OSError, RuntimeError) as error:
+                raise gr.Error(str(error)) from error
+
+        replay_find.click(find_replay_episodes,
+                          inputs=[experiment_state, replay_basin],
+                          outputs=[replay_episode, replay_status])
+        replay_basin.change(
+            lambda: (gr.Dropdown(choices=[], value=None), None,
+                     gr.Slider(value=1, interactive=False), None, None, None, None,
+                     "Find rainfall episodes for this basin.", None, None, None),
+            outputs=[replay_episode, replay_state, replay_day, replay_weather,
+                     replay_discharge, replay_bucket, replay_scene,
+                     replay_status, replay_gif, replay_preview, replay_inputs],
+        )
+        replay_show.click(show_replay,
+                          inputs=[experiment_state, replay_basin, replay_episode],
+                          outputs=[replay_state, replay_day, replay_weather,
+                                   replay_discharge, replay_bucket, replay_scene,
+                                   replay_inputs, replay_status, replay_gif,
+                                   replay_preview])
+        replay_day.input(select_replay_day, inputs=[replay_state, replay_day],
+                         outputs=[replay_weather, replay_discharge, replay_bucket,
+                                  replay_scene, replay_status])
+        replay_download.click(download_replay_gif, inputs=replay_state,
+                              outputs=[replay_gif, replay_preview])
+
         def result_views(result, basin):
             import plotly.graph_objects as go
 
@@ -1104,6 +1254,10 @@ the leaderboard lets you revisit and compare saved runs.
                 losses, metric_value, pd.DataFrame(result.extreme_events), *file_values,
                 leaderboard_rows(saved_runs), registry_message,
                 gr.Dropdown(choices=scenario_choices, value=basin), *scenario_result,
+                gr.Dropdown(choices=scenario_choices, value=basin),
+                gr.Dropdown(choices=[], value=None), None,
+                gr.Slider(value=1, interactive=False), None, None, None, None,
+                "Choose a basin and find rainfall episodes.", None, None, None,
             )
 
         def refresh_result(basin, result):
@@ -1136,7 +1290,9 @@ the leaderboard lets you revisit and compare saved runs.
                          hydrograph,scatter,routing_plot,loss_plot,metrics,extremes,
                          predictions_file,metrics_file,config_file,archive_file,
                          leaderboard,registry_status,scenario_basin,scenario_summary,
-                         scenario_plot,scenario_events],
+                         scenario_plot,scenario_events,replay_basin,replay_episode,replay_state,
+                         replay_day,replay_weather,replay_discharge,replay_bucket,replay_scene,
+                         replay_status,replay_gif,replay_preview,replay_inputs],
                 concurrency_id="regional-training", concurrency_limit=1,
             )
         result_outputs=[active_basin,historical_map,future_map,hydrograph,scatter,routing_plot,loss_plot]

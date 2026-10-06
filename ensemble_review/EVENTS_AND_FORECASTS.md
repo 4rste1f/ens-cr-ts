@@ -1,5 +1,30 @@
 # Hydrological events and forecast setup
 
+## Rainfall–runoff replay
+
+After a regional run, open **Rainfall–runoff replay**, choose a target basin,
+find rainfall episodes, and show one. The animation uses the run's predictions
+and the basin's CAMELS-CH simulation-based daily precipitation and PET plus
+observed gauge discharge. Each predicted day is based on the preceding input
+window (30 days by default), with predicted discharge averaged across seeds.
+The day slider steps through 14 test days across four separate views: weather,
+gauge discharge, teaching bucket, and a dated input-to-prediction diagram.
+The diagram summarizes the preceding model-input window and the target day's
+predicted and observed discharge. In rolling mode it labels predicted discharge
+fed back as the preceding day's flow. Target-day weather is outside that day's
+input window. Generate GIF
+shows the animation in the app and provides a download with the same four
+views; install the
+`animations` extra to enable GIF export (`pip install -e '.[animations]'`).
+
+The bucket chart is a separate, uncalibrated teaching simulation. Rain enters
+storage; evaporation is limited by PET and available water; 30% of the
+remainder is released each day. Its storage, evaporation, and release are not
+internal states or outputs of the trained ensemble. PET is
+potential evaporation demand, not observed actual evaporation. The replay
+requires the original CAMELS-CH data directory; saved prediction CSVs alone
+do not contain meteorological inputs.
+
 The Task tab offers three analysis choices. Daily discharge forecasting reports
 continuous discharge metrics. Statistical extremes retain the existing
 single-day high-flow threshold evaluation. Hydrological event evaluation adds
